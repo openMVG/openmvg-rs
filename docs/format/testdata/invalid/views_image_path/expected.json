@@ -1,0 +1,4 @@
+{
+  "rule": "views.image_path",
+  "description": "an image path leaves the dataset root"
+}

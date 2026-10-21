@@ -1,0 +1,4 @@
+{
+  "rule": "views.image_null",
+  "description": "a view with a ground-truth pose has no image"
+}

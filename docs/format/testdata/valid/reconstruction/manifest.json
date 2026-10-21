@@ -1,0 +1,39 @@
+{
+  "omvg": "0.1-draft",
+  "generator": "make_testdata.py",
+  "profiles": [
+    "reconstruction"
+  ],
+  "length_unit": "meter",
+  "extensions_used": [],
+  "extensions_required": [],
+  "dataset": {
+    "name": "OMVG conformance vector",
+    "license": "CC0-1.0",
+    "url": "https://example.org/omvg",
+    "citation": "none"
+  },
+  "tables": {
+    "cameras": {
+      "rows": 4,
+      "hash": "sha256:dbd2a6549e0ded1804a5d3f9c114e6f513ff5853adf646808d09337b6dd235c6"
+    },
+    "observations": {
+      "rows": 24,
+      "hash": "sha256:ac8707b208f268c7cdb212001c875689b583b6a9835b57c9dc59730ad1572ea9"
+    },
+    "points": {
+      "rows": 6,
+      "hash": "sha256:7724404c7f76cb56d142f842f1ad8d389d8bc9bd9499ed342327f5c719bd7317"
+    },
+    "poses": {
+      "rows": 3,
+      "hash": "sha256:ddab72706057889936ebfdf8f1fa445014c1799837e46e8bed4fe818897d24e4"
+    },
+    "views": {
+      "rows": 5,
+      "hash": "sha256:fdcef3dfa9e2f71038d449202b3653bb8008ab55811b22a034e03e1666ca843b"
+    }
+  },
+  "content_hash": "sha256:a8095867d40c7c4057d20485b96e63a7c5d9ee869e9bac2d213f17e64d29d7b8"
+}

@@ -1,0 +1,61 @@
+[package]
+name = "openmvg-io"
+description = "Reader, writer, and validator of the OMVG community format, and COLMAP export, for OpenMVG-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/openmvg-io"
+keywords = ["computer-vision", "sfm", "photogrammetry", "parquet", "colmap"]
+categories = ["computer-vision", "encoding", "science::robotics"]
+include = ["src/**", "examples/**", "Cargo.toml", "README.md", "LICENSE-APACHE", "LICENSE-MIT"]
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["omvg"]
+# The OMVG format: its reader, writer, and validator, and the `omvg` binary. Without it the crate
+# is the COLMAP export alone and resolves no Arrow or Parquet.
+omvg = [
+    "dep:parquet",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:arrow-select",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+]
+
+# The heavy columnar dependencies live here and nowhere else in the supported crates;
+# `scripts/check_architecture.py` enforces that boundary.
+[dependencies]
+openmvg-core = { workspace = true }
+openmvg-sfm = { workspace = true }
+nalgebra = { workspace = true }
+parquet = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+arrow-select = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The crate docs show a reconstruction from a folder of images.
+openmvg-sfm = { workspace = true, features = ["image-io"] }
+
+[[bin]]
+name = "omvg"
+required-features = ["omvg"]
+
+[[example]]
+name = "write_check_read"
+required-features = ["omvg"]
+
+[[test]]
+name = "omvg_validate"
+required-features = ["omvg"]

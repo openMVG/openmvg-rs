@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 540" width="100%" style="max-width:900px" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" fill="currentColor" role="img" aria-labelledby="cv-title cv-desc">
+<title id="cv-title">Camera and image conventions</title>
+<desc id="cv-desc">A world frame and a camera with center C. The camera X axis points right, Y down, and Z forward along the optical axis. A 3D point projects along a ray to the pixel (u, v), and the unit bearing points from C along that ray. The inset shows pixel (0, 0) centered on the top-left pixel, with u growing right and v growing down.</desc>
+<defs>
+<marker id="cv-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,1 L10,5 L0,9 z" fill="currentColor"/></marker>
+<marker id="cv-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,1 L10,5 L0,9 z" fill="#3a86d4"/></marker>
+<marker id="cv-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,1 L10,5 L0,9 z" fill="#d9731f"/></marker>
+</defs>
+<g fill="none" stroke="currentColor" stroke-width="1.5">
+<line x1="90" y1="470" x2="146" y2="487" marker-end="url(#cv-ink)"/>
+<line x1="90" y1="470" x2="90" y2="414" marker-end="url(#cv-ink)"/>
+<line x1="90" y1="470" x2="60" y2="497" marker-end="url(#cv-ink)"/>
+<line x1="90" y1="470" x2="233" y2="384" stroke-dasharray="5 4" marker-end="url(#cv-ink)"/>
+</g>
+<text x="82" y="526">world frame</text>
+<text x="157" y="420" text-anchor="middle" font-size="11" transform="rotate(-31 157 420)"><tspan font-style="italic">C</tspan> in world coordinates</text>
+<rect x="396" y="190" width="250" height="176" fill="#3a86d4" fill-opacity="0.1" stroke="#3a86d4" stroke-width="1.5"/>
+<rect x="396" y="190" width="22" height="22" fill="none" stroke="currentColor" stroke-dasharray="3 2"/>
+<text x="646" y="386" text-anchor="end">image plane</text>
+<g stroke="#3a86d4" stroke-width="1.8" fill="none">
+<line x1="240" y1="380" x2="318" y2="380" marker-end="url(#cv-blue)"/>
+<line x1="240" y1="380" x2="240" y2="455" marker-end="url(#cv-blue)"/>
+<line x1="240" y1="380" x2="744" y2="196" marker-end="url(#cv-blue)"/>
+</g>
+<text x="326" y="385"><tspan font-style="italic">X</tspan> right</text>
+<text x="248" y="470"><tspan font-style="italic">Y</tspan> down</text>
+<text x="754" y="200"><tspan font-style="italic">Z</tspan> forward</text>
+<text x="754" y="216" font-size="12">optical axis</text>
+<text x="252" y="408" font-size="12">camera frame</text>
+<circle cx="521.3" cy="277.5" r="2.5"/>
+<text x="529" y="295" font-size="12">principal point (<tspan font-style="italic">c</tspan><tspan dy="3" font-size="9">x</tspan><tspan dy="-3">, </tspan><tspan font-style="italic">c</tspan><tspan dy="3" font-size="9">y</tspan><tspan dy="-3">)</tspan></text>
+<line x1="240" y1="380" x2="774.6" y2="96.3" stroke="#d9731f" stroke-width="1.5"/>
+<line x1="240" y1="380" x2="358.8" y2="317" stroke="#d9731f" stroke-width="3.5" marker-end="url(#cv-orange)"/>
+<circle cx="774.6" cy="96.3" r="5.5" fill="#d9731f"/>
+<circle cx="537" cy="222.4" r="3.5"/>
+<text x="528" y="210" text-anchor="end">pixel (<tspan font-style="italic">u</tspan>, <tspan font-style="italic">v</tspan>)</text>
+<circle cx="240" cy="380" r="4"/>
+<text x="228" y="372" text-anchor="end" font-size="15" font-style="italic">C</text>
+<text x="786" y="92" font-size="12">3D point</text>
+<text x="786" y="108"><tspan font-style="italic">X</tspan><tspan dy="3" font-size="10">world</tspan><tspan dy="-3" font-size="12"> in world</tspan></text>
+<text x="786" y="124"><tspan font-style="italic">X</tspan><tspan dy="3" font-size="10">cam</tspan><tspan dy="-3" font-size="12"> in camera</tspan></text>
+<text x="256" y="300">unit bearing</text>
+<text x="256" y="318"><tspan font-style="italic">X</tspan><tspan dy="3" font-size="10">cam</tspan><tspan dy="-3"> / ‖</tspan><tspan font-style="italic">X</tspan><tspan dy="3" font-size="10">cam</tspan><tspan dy="-3">‖</tspan></text>
+<g fill="none" stroke="currentColor" stroke-width="1" stroke-opacity="0.5">
+<rect x="24" y="30" width="268" height="232" rx="6"/>
+<line x1="292" y1="30" x2="396" y2="190" stroke-dasharray="3 3"/>
+<line x1="292" y1="262" x2="396" y2="212" stroke-dasharray="3 3"/>
+</g>
+<text x="36" y="52" font-size="12">top-left corner of the image</text>
+<rect x="72" y="66" width="50" height="50" fill="#3a86d4" fill-opacity="0.22"/>
+<path d="M72,66 H222 M72,116 H222 M72,166 H222 M72,216 H222 M72,66 V216 M122,66 V216 M172,66 V216 M222,66 V216" fill="none" stroke="currentColor" stroke-opacity="0.55"/>
+<g fill="none" stroke="#3a86d4" stroke-width="1.8">
+<line x1="97" y1="91" x2="262" y2="91" marker-end="url(#cv-blue)"/>
+<line x1="97" y1="91" x2="97" y2="244" marker-end="url(#cv-blue)"/>
+</g>
+<circle cx="97" cy="91" r="4"/>
+<circle cx="147" cy="91" r="2.5"/>
+<circle cx="197" cy="91" r="2.5"/>
+<circle cx="97" cy="141" r="2.5"/>
+<circle cx="147" cy="141" r="2.5"/>
+<circle cx="197" cy="141" r="2.5"/>
+<circle cx="97" cy="191" r="2.5"/>
+<circle cx="147" cy="191" r="2.5"/>
+<circle cx="197" cy="191" r="2.5"/>
+<g font-size="11" text-anchor="middle">
+<text x="97" y="82">(0, 0)</text>
+<text x="147" y="82">(1, 0)</text>
+<text x="197" y="82">(2, 0)</text>
+</g>
+<g font-size="11" text-anchor="end">
+<text x="66" y="145">(0, 1)</text>
+<text x="66" y="195">(0, 2)</text>
+</g>
+<text x="268" y="96" font-style="italic">u</text>
+<text x="104" y="254" font-style="italic">v</text>
+<text x="110" y="236" font-size="11">pixel centers at integer coordinates</text>
+</svg>

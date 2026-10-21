@@ -1,0 +1,4 @@
+{
+  "rule": "value.null",
+  "description": "a required column holds a null"
+}

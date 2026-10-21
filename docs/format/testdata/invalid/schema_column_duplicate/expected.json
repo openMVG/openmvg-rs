@@ -1,0 +1,4 @@
+{
+  "rule": "schema.column_name",
+  "description": "views has two image columns"
+}

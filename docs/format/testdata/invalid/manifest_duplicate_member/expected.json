@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.file",
+  "description": "manifest.json repeats a member"
+}

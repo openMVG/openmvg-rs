@@ -1,0 +1,4 @@
+{
+  "rule": "observations.unregistered_view",
+  "description": "observations in a view whose pose has no row"
+}

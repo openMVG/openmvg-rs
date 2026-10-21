@@ -1,0 +1,6 @@
+# Python outside the bindings package: the repository scripts and the OMVG format reference.
+# Same rules as `bindings/python/pyproject.toml`, which governs the bindings.
+line-length = 100
+
+[lint]
+extend-select = ["B", "I", "UP"]

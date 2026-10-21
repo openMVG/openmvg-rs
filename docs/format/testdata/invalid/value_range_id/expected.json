@@ -1,0 +1,4 @@
+{
+  "rule": "value.range",
+  "description": "a view id is -1"
+}

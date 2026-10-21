@@ -1,0 +1,4 @@
+{
+  "rule": "reference.dangling",
+  "description": "a match names a feature its view does not have"
+}

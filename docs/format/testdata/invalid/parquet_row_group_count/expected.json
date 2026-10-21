@@ -1,0 +1,4 @@
+{
+  "rule": "parquet.file",
+  "description": "the footer claims 2^31 - 1 row groups in a few hundred bytes"
+}

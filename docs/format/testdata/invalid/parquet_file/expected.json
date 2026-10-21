@@ -1,0 +1,4 @@
+{
+  "rule": "parquet.file",
+  "description": "a listed table file is missing"
+}

@@ -1,0 +1,32 @@
+[package]
+name = "openmvg-rs-python"
+description = "Native extension of the openmvg-rs Python package, built with maturin"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "openmvg_rs_native"
+crate-type = ["cdylib"]
+# The extension is exercised from Python (tests/); a Rust test harness would have to link
+# libpython.
+test = false
+doctest = false
+
+[dependencies]
+nalgebra = { workspace = true }
+numpy = "0.29"
+openmvg-core = { workspace = true }
+openmvg-geometry = { workspace = true }
+# COLMAP export only: without the `omvg` feature the crate resolves no Arrow or Parquet.
+openmvg-io = { workspace = true }
+openmvg-sfm = { workspace = true, features = [
+    "image-io",
+    "parallel",
+    "console-progress",
+] }
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
+rayon = { workspace = true }

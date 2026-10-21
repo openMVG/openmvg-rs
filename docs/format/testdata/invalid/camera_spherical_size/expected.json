@@ -1,0 +1,4 @@
+{
+  "rule": "camera.spherical_size",
+  "description": "a SPHERICAL camera's height is not width / 2"
+}

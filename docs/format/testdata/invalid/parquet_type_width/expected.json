@@ -1,0 +1,4 @@
+{
+  "rule": "parquet.type",
+  "description": "width is stored as INT64"
+}

@@ -1,0 +1,4 @@
+{
+  "rule": "observations.pixel_mismatch",
+  "description": "an observed x differs from its keypoint by one ulp"
+}

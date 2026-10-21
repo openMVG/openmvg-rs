@@ -1,0 +1,4 @@
+{
+  "rule": "schema.missing_column",
+  "description": "observations has no y column"
+}

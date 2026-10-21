@@ -1,0 +1,3 @@
+{
+  "description": "a table of an unknown extension: no key, nulls, a fixed-size list hashed as LIST<DOUBLE>, an all-null column"
+}

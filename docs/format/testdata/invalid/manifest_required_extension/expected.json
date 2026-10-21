@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.required_extension",
+  "description": "an extension this reader does not implement is required"
+}

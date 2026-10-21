@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.file",
+  "description": "an unknown member of manifest.json is NaN, which JSON does not allow"
+}

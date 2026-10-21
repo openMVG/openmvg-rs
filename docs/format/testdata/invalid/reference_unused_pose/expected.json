@@ -1,0 +1,4 @@
+{
+  "rule": "reference.unused_pose",
+  "description": "a pose no view references"
+}

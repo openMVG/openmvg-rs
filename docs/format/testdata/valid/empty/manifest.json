@@ -1,0 +1,29 @@
+{
+  "omvg": "0.1-draft",
+  "generator": "make_testdata.py",
+  "profiles": [
+    "dataset"
+  ],
+  "length_unit": "unknown",
+  "extensions_used": [],
+  "extensions_required": [],
+  "tables": {
+    "cameras": {
+      "rows": 1,
+      "hash": "sha256:044f14d58113bb9282cc89082af8146924a5772f32bbf9473a9a99838fc7f357"
+    },
+    "keypoints": {
+      "rows": 0,
+      "hash": "sha256:af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+    },
+    "matches": {
+      "rows": 0,
+      "hash": "sha256:af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+    },
+    "views": {
+      "rows": 1,
+      "hash": "sha256:1a15a1afc7ae955b9a08143c683972bc9429fd1e3bdee76c28ea11bc3301bde4"
+    }
+  },
+  "content_hash": "sha256:760044c4a1debc7f71189e6278dad791b45a1f0ffac9bdb83f2eb6e2890de81b"
+}

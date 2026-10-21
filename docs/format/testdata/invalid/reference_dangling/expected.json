@@ -1,0 +1,4 @@
+{
+  "rule": "reference.dangling",
+  "description": "an observation names a missing point and view"
+}

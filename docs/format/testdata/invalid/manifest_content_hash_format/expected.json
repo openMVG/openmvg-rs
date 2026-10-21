@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.content_hash",
+  "description": "content_hash lacks the sha256: prefix"
+}

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 46fc1cb9bc35b7c501c9904cde9bf159730562b749266a62c5aca04584d2623e # shrinks to f = 100.0, cx = 100.0, cy = 100.0, radial = K1K2K3(0.0, -0.006617414429079175, -0.0009711103113657304), tangential = P1P2(0.0, 0.0), point = [[1.4428971284348369, 1.9444677874318852, 1.0]]

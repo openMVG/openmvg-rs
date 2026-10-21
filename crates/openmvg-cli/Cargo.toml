@@ -1,0 +1,46 @@
+[package]
+name = "openmvg-cli"
+description = "Command-line Structure from Motion for OpenMVG-rs: reconstruct a folder of images"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["computer-vision", "sfm", "photogrammetry", "cli", "3d-reconstruction"]
+categories = ["computer-vision", "command-line-utilities", "science::robotics"]
+include = ["src/**", "Cargo.toml", "README.md", "TUI.md", "LICENSE-APACHE", "LICENSE-MIT"]
+
+[features]
+# The `openmvg-sfm-configure` terminal app, which writes the project files of
+# `openmvg-sfm --project`. Off by default: it adds the ratatui stack, which no other tree resolves.
+tui = ["dep:ratatui", "dep:ratatui-image", "dep:image", "dep:kamadak-exif"]
+
+# The command reaches the stable SfM facade only; `scripts/check_architecture.py` keeps the
+# terminal-UI stack out of the default tree.
+[dependencies]
+openmvg-core = { workspace = true }
+openmvg-sfm = { workspace = true, features = ["parallel", "image-io", "console-progress"] }
+openmvg-io = { workspace = true, features = ["omvg"] }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true, optional = true }
+kamadak-exif = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
+ratatui-image = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# Binaries carry no rustdoc: `openmvg-sfm` would overwrite the docs of the `openmvg-sfm` library.
+[[bin]]
+name = "openmvg-sfm"
+path = "src/bin/openmvg-sfm.rs"
+doc = false
+
+[[bin]]
+name = "openmvg-sfm-configure"
+path = "src/bin/openmvg-sfm-configure/main.rs"
+required-features = ["tui"]
+doc = false

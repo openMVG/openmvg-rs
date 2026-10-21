@@ -1,0 +1,4 @@
+{
+  "rule": "views.image_duplicate",
+  "description": "two views share an image"
+}

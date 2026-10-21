@@ -1,0 +1,4 @@
+{
+  "rule": "camera.prefix",
+  "description": "a FISHEYE camera has k4 without k3"
+}

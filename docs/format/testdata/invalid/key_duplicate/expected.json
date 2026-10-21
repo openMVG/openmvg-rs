@@ -1,0 +1,4 @@
+{
+  "rule": "key.duplicate",
+  "description": "two points rows share an id"
+}

@@ -1,0 +1,4 @@
+{
+  "rule": "hash.content",
+  "description": "content_hash does not match the table hashes"
+}

@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.extensions",
+  "description": "an extension name lacks the OMVG_ prefix"
+}

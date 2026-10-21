@@ -1,0 +1,136 @@
+[package]
+name = "openmvg-sfm"
+description = "Incremental and Global Structure from Motion (SfM) engines for OpenMVG-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/openmvg-sfm"
+keywords = ["computer-vision", "reconstruction", "sfm", "photogrammetry"]
+categories = ["algorithms", "computer-vision", "science::robotics"]
+include = ["src/**", "examples/**", "Cargo.toml", "README.md", "LICENSE-APACHE", "LICENSE-MIT"]
+
+# docs.rs documents the supported public profile only; unstable and test-only
+# features (internals, test support) stay out of the published docs.
+[package.metadata.docs.rs]
+features = ["parallel", "image-io", "observer", "console-progress"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# Core crates
+openmvg-core = { workspace = true }
+openmvg-geometry = { workspace = true, features = ["faer"] }
+openmvg-features = { workspace = true, features = ["std"] }
+openmvg-ba = { workspace = true, features = ["faer"] }
+
+# External
+nalgebra = { workspace = true }
+rayon = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+kamadak-exif = { workspace = true, optional = true }
+indicatif = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = ["parallel"]
+observer = []
+unstable-internals = ["observer"]
+unstable-test-support = ["unstable-internals"]
+parallel = [
+    "dep:rayon",
+    "openmvg-features/parallel",
+    "openmvg-geometry/parallel",
+    "openmvg-ba/parallel",
+]
+image-io = [
+    "dep:image",
+    "dep:kamadak-exif",
+]
+# Terminal progress bars (`progress::ConsoleProgress`); native only.
+console-progress = ["dep:indicatif"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[test]]
+name = "adapters"
+required-features = ["unstable-test-support", "image-io"]
+
+[[test]]
+name = "bundle"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "config"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "determinism"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "evaluation"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "foundation_smoke"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "incremental"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "incremental_oracle"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "run"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "reconstruction"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "registration"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "root_seed"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "seed"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "synthetic_acceptance"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "tracks"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "triangulation_allocations"
+harness = false
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "workspace_state"
+required-features = ["unstable-test-support"]
+
+[[example]]
+name = "engines_and_reports"
+required-features = ["image-io"]
+
+[[example]]
+name = "progress_and_cancellation"
+required-features = ["image-io"]

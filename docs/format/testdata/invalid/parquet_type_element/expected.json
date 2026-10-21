@@ -1,0 +1,4 @@
+{
+  "rule": "parquet.type",
+  "description": "rotation elements are stored as FLOAT"
+}

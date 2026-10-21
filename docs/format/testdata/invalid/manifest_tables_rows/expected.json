@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.tables",
+  "description": "a row count is negative"
+}

@@ -1,0 +1,59 @@
+[package]
+name = "openmvg"
+description = "Umbrella crate re-exporting the OpenMVG-rs core, geometry, features, Structure from Motion and OMVG format crates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/openmvg"
+keywords = ["computer-vision", "geometry", "sfm", "photogrammetry"]
+categories = ["algorithms", "computer-vision", "mathematics", "science::robotics"]
+include = ["src/**", "examples/**", "figures/**", "Cargo.toml", "README.md", "LICENSE-APACHE", "LICENSE-MIT"]
+
+# docs.rs documents the supported public profile only; unstable and test-only
+# features (internals, test support) stay out of the published docs.
+[package.metadata.docs.rs]
+features = ["full"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+openmvg-core = { workspace = true }
+openmvg-geometry = { workspace = true }
+openmvg-features = { workspace = true, optional = true }
+openmvg-sfm = { workspace = true, optional = true }
+openmvg-io = { workspace = true, optional = true, features = ["omvg"] }
+
+[dev-dependencies]
+nalgebra = { workspace = true }
+
+[features]
+default = ["features", "faer", "parallel"]
+# Sparse averaging and positioning in `openmvg-geometry`, on the sparse Cholesky of `openmvg-ba`.
+# `openmvg-sfm` always enables `faer` in `openmvg-geometry` and `openmvg-ba`, so `sfm` builds use
+# it with or without this feature.
+faer = ["openmvg-geometry/faer"]
+# Native multi-threading for every enabled crate (not for wasm32); `openmvg-sfm/parallel` also
+# enables `openmvg-ba/parallel`.
+parallel = [
+    "openmvg-geometry/parallel",
+    "openmvg-features?/parallel",
+    "openmvg-sfm?/parallel",
+]
+features = ["dep:openmvg-features", "openmvg-features/std"]
+sfm = ["dep:openmvg-sfm"]
+sfm-image-io = ["sfm", "openmvg-sfm/image-io"]
+sfm-observer = ["sfm", "openmvg-sfm/observer"]
+# OMVG community format and COLMAP export (`openmvg::io`); the only feature that brings in
+# Arrow and Parquet.
+io = ["sfm", "dep:openmvg-io"]
+full = ["features", "faer", "parallel", "sfm-image-io", "sfm-observer", "io"]
+
+[[example]]
+name = "sfm"
+required-features = ["sfm-image-io", "io"]
+
+[[example]]
+name = "two_view_from_scratch"
+required-features = ["sfm-image-io"]

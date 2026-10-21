@@ -1,0 +1,4 @@
+{
+  "rule": "keypoints.dense",
+  "description": "a view skips feature index 9"
+}

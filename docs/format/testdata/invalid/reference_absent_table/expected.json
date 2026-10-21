@@ -1,0 +1,4 @@
+{
+  "rule": "reference.dangling",
+  "description": "observations is present but points is absent"
+}

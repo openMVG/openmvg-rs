@@ -1,0 +1,141 @@
+[package]
+name = "openmvg-ba"
+description = "Checked bundle adjustment and nonlinear numerical primitives for OpenMVG-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/openmvg-ba"
+keywords = ["computer-vision", "bundle-adjustment", "optimization", "photogrammetry"]
+categories = ["algorithms", "computer-vision", "mathematics", "science::robotics"]
+include = [
+    "src/**",
+    "examples/**",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+]
+autotests = false
+
+# docs.rs documents the supported public profile only; unstable and test-only
+# features (internals, test support) stay out of the published docs.
+[package.metadata.docs.rs]
+features = ["faer", "parallel"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+nalgebra = { workspace = true }
+faer = { workspace = true, optional = true, features = ["std", "sparse-linalg"] }
+openmvg-core = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true, optional = true }
+crossbeam-utils = { workspace = true, optional = true }
+
+[features]
+default = ["faer"]
+faer = ["dep:faer"]
+parallel = ["faer", "dep:rayon", "dep:crossbeam-utils"]
+# In-tree validation kernels; no semver guarantee.
+unstable-internals = []
+
+[dev-dependencies]
+proptest = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[[test]]
+name = "zero_alloc"
+harness = false
+required-features = ["unstable-internals"]
+
+[[test]]
+name = "contract"
+
+[[test]]
+name = "solution_contract"
+
+[[test]]
+name = "native_capabilities"
+required-features = ["faer"]
+
+[[test]]
+name = "bundle_adjustment"
+required-features = ["unstable-internals"]
+
+[[test]]
+name = "multi_view_bundle_adjustment"
+required-features = ["unstable-internals"]
+
+[[test]]
+name = "multi_view_evaluation"
+required-features = ["unstable-internals"]
+
+[[test]]
+name = "multi_view_triangulation"
+required-features = ["unstable-internals"]
+
+[[test]]
+name = "properties"
+required-features = ["unstable-internals"]
+
+[[test]]
+name = "self_calibration"
+required-features = ["unstable-internals"]
+
+[[test]]
+name = "sparse_bundle_adjustment"
+required-features = ["unstable-internals", "faer"]
+
+[[test]]
+name = "sparse_fixed_rotation"
+required-features = ["unstable-internals", "faer"]
+
+[[test]]
+name = "sparse_scale_backend_differential"
+required-features = ["unstable-internals", "faer"]
+
+[[test]]
+name = "sparse_self_calibration"
+required-features = ["unstable-internals", "faer"]
+
+[[test]]
+name = "sparse_self_calibration_factors"
+required-features = ["unstable-internals", "faer"]
+
+[[test]]
+name = "statistical_validation"
+required-features = ["unstable-internals"]
+
+[[test]]
+name = "parallel_assembly_zero_alloc"
+harness = false
+required-features = ["unstable-internals", "faer", "parallel"]
+
+[[bench]]
+name = "two_view_ba"
+harness = false
+test = false
+required-features = ["unstable-internals"]
+
+[[bench]]
+name = "multi_view_ba"
+harness = false
+test = false
+required-features = ["unstable-internals", "faer"]
+
+[[bench]]
+name = "dense_vs_sparse_ba"
+harness = false
+test = false
+required-features = ["unstable-internals", "faer"]
+
+[[example]]
+name = "native_bundle_adjustment"
+required-features = ["faer"]
+
+[[example]]
+name = "robust_loss_and_gauge"
+required-features = ["faer"]

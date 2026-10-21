@@ -1,0 +1,4 @@
+{
+  "rule": "matches.inlier_mixed",
+  "description": "an unverified pair has one non-null inlier flag"
+}

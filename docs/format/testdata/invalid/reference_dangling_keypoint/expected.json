@@ -1,0 +1,4 @@
+{
+  "rule": "reference.dangling",
+  "description": "an observation names a feature its view does not have"
+}

@@ -1,0 +1,4 @@
+{
+  "rule": "value.range",
+  "description": "a camera width is 0"
+}

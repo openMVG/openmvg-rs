@@ -1,0 +1,37 @@
+# cargo-deny policy for the dependency graph of the published crates: licences, and the
+# advisories that `cargo deny check advisories` reports.
+# Run the licence check with `pixi run deny` (CI runs the same check).
+#
+# Inbound = outbound: every dependency must be usable under the project's
+# `MIT OR Apache-2.0` terms. An SPDX `OR` expression passes when any one of its
+# licences is allowed.
+
+[graph]
+all-features = true
+exclude-dev = true
+exclude-unpublished = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+# Public-domain dedication. Arrow reaches it only through the `const-random-macro`
+# proc-macro, so it runs at build time and links into no OpenMVG binary.
+[[licenses.exceptions]]
+crate = "tiny-keccak"
+allow = ["CC0-1.0"]
+
+[advisories]
+ignore = [
+    # `paste` is unmaintained. It is a proc-macro that faer's `gemm` uses, so it runs at build
+    # time and links into no OpenMVG binary; faer 0.24.4 and gemm 0.19.0, the latest releases,
+    # still depend on it. Revisit when faer moves off it.
+    { id = "RUSTSEC-2024-0436", reason = "build-time proc-macro of faer's gemm; no maintained upstream release drops it" },
+]

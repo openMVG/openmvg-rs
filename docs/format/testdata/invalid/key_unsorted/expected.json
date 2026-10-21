@@ -1,0 +1,4 @@
+{
+  "rule": "key.unsorted",
+  "description": "points rows are out of order"
+}

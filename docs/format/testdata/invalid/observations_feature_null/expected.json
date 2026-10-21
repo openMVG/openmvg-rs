@@ -1,0 +1,4 @@
+{
+  "rule": "observations.feature_null",
+  "description": "an observation without a feature while keypoints is present"
+}

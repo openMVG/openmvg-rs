@@ -1,0 +1,4 @@
+{
+  "rule": "rotation",
+  "description": "a pose rotation is scaled by 1 + 1e-6"
+}

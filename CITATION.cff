@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use OpenMVG-rs in your work, please cite it as below, together with the original OpenMVG paper."
+type: software
+title: "OpenMVG-rs: Multiple View Geometry and Structure from Motion in Rust"
+authors:
+  - family-names: Moulon
+    given-names: Pierre
+  - name: "OpenMVG-rs contributors"
+version: 0.1.0
+license:
+  - MIT
+  - Apache-2.0
+repository-code: "https://github.com/openMVG/openmvg-rs"
+keywords:
+  - computer vision
+  - multiple view geometry
+  - structure from motion
+  - bundle adjustment
+  - rust
+references:
+  - type: conference-paper
+    title: "OpenMVG: Open Multiple View Geometry"
+    authors:
+      - family-names: Moulon
+        given-names: Pierre
+      - family-names: Monasse
+        given-names: Pascal
+      - family-names: Perrot
+        given-names: Romuald
+      - family-names: Marlet
+        given-names: Renaud
+    collection-title: "International Workshop on Reproducible Research in Pattern Recognition (RRPR)"
+    start: 60
+    end: 74
+    year: 2016

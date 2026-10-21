@@ -1,0 +1,4 @@
+{
+  "rule": "parquet.file",
+  "description": "the footer and the manifest say 9 rows, the row groups hold 8"
+}

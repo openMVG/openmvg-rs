@@ -1,0 +1,4 @@
+{
+  "rule": "hash.table",
+  "description": "a value changed after the table was hashed"
+}

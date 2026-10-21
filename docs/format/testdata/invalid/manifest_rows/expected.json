@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.rows",
+  "description": "a row count disagrees with the file"
+}

@@ -1,0 +1,64 @@
+[package]
+name = "openmvg-features"
+description = "Feature detection, description, matching and tracking for OpenMVG-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/openmvg-features"
+keywords = ["computer-vision", "feature-detection", "image-matching", "sfm"]
+categories = ["algorithms", "computer-vision", "science"]
+include = ["/src/**", "/examples/**", "/scripts/alp/**", "/Cargo.toml", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
+
+# docs.rs documents the native profile; `libm` is the no_std alternative to `std`.
+[package.metadata.docs.rs]
+features = ["std", "parallel"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+openmvg-core = { workspace = true, optional = true }
+nalgebra = { version = "0.35", default-features = false, features = ["alloc"] }
+
+# std-only
+thiserror = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+pulp = { workspace = true, optional = true }
+
+# Parallel execution requires the standard library.
+rayon = { workspace = true, optional = true }
+
+# no_std math
+libm = { version = "0.2", optional = true }
+
+[features]
+default = ["std", "parallel"]
+std = ["nalgebra/std", "dep:thiserror", "dep:openmvg-core", "dep:serde", "dep:pulp"]
+parallel = ["std", "dep:rayon"]
+libm = ["nalgebra/libm", "dep:libm"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "detector_benchmark"
+harness = false
+
+[[bench]]
+name = "distance_benchmark"
+harness = false
+required-features = ["std"]
+
+[[bench]]
+name = "matcher_benchmark"
+harness = false
+required-features = ["std"]
+
+[[bench]]
+name = "tracking_benchmark"
+harness = false
+required-features = ["std"]

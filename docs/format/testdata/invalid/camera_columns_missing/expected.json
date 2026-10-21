@@ -1,0 +1,4 @@
+{
+  "rule": "camera.columns",
+  "description": "a PINHOLE camera has no fy"
+}

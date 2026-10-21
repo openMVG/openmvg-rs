@@ -1,0 +1,51 @@
+{
+  "omvg": "0.1-draft",
+  "generator": "make_testdata.py",
+  "profiles": [
+    "benchmark",
+    "dataset",
+    "reconstruction"
+  ],
+  "length_unit": "unknown",
+  "extensions_used": [],
+  "extensions_required": [],
+  "tables": {
+    "cameras": {
+      "rows": 1,
+      "hash": "sha256:11823d530f944dae66e500e4931842cba653233241a13a5cf9f14159de23a268"
+    },
+    "gt_poses": {
+      "rows": 3,
+      "hash": "sha256:32d12126e095bd3d91d661a60af365a8e963c0f8aa46c43c3b66f3a2b6de007d"
+    },
+    "keypoints": {
+      "rows": 40,
+      "hash": "sha256:ceb0f60d3c72246600cdb8b884dcbe0b9dac78b541cb4605a2ea9dd0a5009597"
+    },
+    "matches": {
+      "rows": 54,
+      "hash": "sha256:bbac36a729a29e57c995bfd4e8e90b81e6b82efc565d009f1e78e7e5985c3a30"
+    },
+    "observations": {
+      "rows": 32,
+      "hash": "sha256:0cc8e0454495625e8ad8ed86ecaf336507e55c7d82da036cf926253c21681492"
+    },
+    "pairs": {
+      "rows": 5,
+      "hash": "sha256:203669c7d6c4288feffab08cb5abb2485739097b71558fe1e5a070eace6cba3c"
+    },
+    "points": {
+      "rows": 8,
+      "hash": "sha256:b7b7a1bc7e3904f9c6c07cba28aa2e4a2d0a26a27fadbeb39e8dfca49ea8e034"
+    },
+    "poses": {
+      "rows": 4,
+      "hash": "sha256:b78596c0b4bd9e80b35b170212f043c3fc9fa97bce77fa176e199f5829bdb042"
+    },
+    "views": {
+      "rows": 4,
+      "hash": "sha256:96b26e35098d1a1f684f5484915440cbe45562e52d6a0a1315451b685844c517"
+    }
+  },
+  "content_hash": "sha256:ebceb998851682d1b8a4b629d3706fcc4abe24896b84321472fe01a005dc756f"
+}

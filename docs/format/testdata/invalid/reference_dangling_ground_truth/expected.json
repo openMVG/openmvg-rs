@@ -1,0 +1,4 @@
+{
+  "rule": "reference.dangling",
+  "description": "a ground-truth pose names a missing view"
+}

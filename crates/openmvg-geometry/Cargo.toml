@@ -1,0 +1,101 @@
+[package]
+name = "openmvg-geometry"
+description = "Multiple view geometry solvers, triangulation, averaging and robust estimation for OpenMVG-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/openmvg-geometry"
+keywords = ["computer-vision", "geometry", "sfm", "pose-estimation"]
+categories = ["algorithms", "computer-vision", "mathematics", "science::robotics"]
+include = ["src/**", "examples/**", "Cargo.toml", "README.md", "LICENSE-APACHE", "LICENSE-MIT"]
+
+# docs.rs documents the supported public profile only; `unstable-test-support`
+# stays out of the published docs.
+[package.metadata.docs.rs]
+features = ["faer", "parallel"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+openmvg-core = { workspace = true }
+openmvg-ba = { workspace = true, default-features = false }
+nalgebra = { workspace = true }
+num-traits = { workspace = true }
+arrayvec = { workspace = true }
+rayon = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
+# Sparse rotation averaging and global positioning, on `openmvg_ba::numerics::sparse`.
+faer = ["openmvg-ba/faer"]
+# Native multi-threading (Rayon) for global positioning. Every parallel loop
+# has a serial fallback with identical results, so disabling it only changes
+# speed.
+parallel = ["dep:rayon"]
+# Internal: exposes hidden hooks for this crate's own integration tests. No
+# semver guarantee; not part of the supported API.
+unstable-test-support = []
+
+[dev-dependencies]
+criterion = { workspace = true }
+faer = { workspace = true }
+roots = { workspace = true }
+approx = { workspace = true }
+proptest = { workspace = true }
+rand = { workspace = true, features = ["std"] }
+rand_chacha = { workspace = true }
+rand_distr = { workspace = true, features = ["std"] }
+
+[[bench]]
+name = "p3p_benchmark"
+harness = false
+
+[[bench]]
+name = "seven_point_benchmark"
+harness = false
+
+[[bench]]
+name = "rotation_averaging_benchmark"
+harness = false
+required-features = ["faer"]
+
+[[bench]]
+name = "graph_topology_benchmark"
+harness = false
+
+[[bench]]
+name = "ransac_benchmark"
+harness = false
+
+[[test]]
+name = "five_point_allocations"
+harness = false
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "five_point_reference"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "global_positioning_zero_alloc"
+harness = false
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "p3p_allocations"
+harness = false
+
+[[test]]
+name = "p4pf_reference"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "pnp_refinement"
+required-features = ["unstable-test-support"]
+
+[[test]]
+name = "triangulation_allocations"
+harness = false

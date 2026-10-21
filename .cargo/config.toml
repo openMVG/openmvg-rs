@@ -1,0 +1,9 @@
+# x86-64-v2 (every x86-64 CPU since ~2009) enables the hardware POPCNT that
+# binary descriptor matching relies on; baseline x86-64 lowers `count_ones` to
+# a software sequence. Downstream crates do not inherit this file.
+#
+# Only portable settings belong here: wheel containers, editors, and builds
+# without pixi read this file too. The pixi environments add the mold linker
+# (`activation.env` in pixi.toml), and Cargo adds its flags to these.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

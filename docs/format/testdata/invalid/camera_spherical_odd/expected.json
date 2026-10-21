@@ -1,0 +1,4 @@
+{
+  "rule": "camera.spherical_size",
+  "description": "a SPHERICAL camera's width is odd"
+}

@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.profile_tables",
+  "description": "the benchmark profile's gt_poses table is not listed"
+}

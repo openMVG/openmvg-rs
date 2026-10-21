@@ -1,0 +1,4 @@
+{
+  "rule": "pairs.model_columns",
+  "description": "an essential pair with a rotation but no translation"
+}

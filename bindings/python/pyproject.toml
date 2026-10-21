@@ -1,0 +1,55 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "openmvg-rs"
+description = "Sparse 3D reconstruction (Structure from Motion) from a folder of images"
+readme = "README.md"
+dynamic = ["version"]
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26"]
+license = "MIT OR Apache-2.0"
+authors = [{ name = "OpenMVG-rs contributors" }]
+license-files = ["LICENSE-APACHE", "LICENSE-MIT", "THIRD_PARTY_LICENSES.txt"]
+keywords = ["structure-from-motion", "photogrammetry", "3d-reconstruction", "computer-vision"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/openMVG/openmvg-rs"
+Documentation = "https://github.com/openMVG/openmvg-rs/blob/HEAD/bindings/python/README.md"
+Repository = "https://github.com/openMVG/openmvg-rs"
+Issues = "https://github.com/openMVG/openmvg-rs/issues"
+Changelog = "https://github.com/openMVG/openmvg-rs/blob/HEAD/CHANGELOG.md"
+
+[tool.maturin]
+module-name = "openmvg_rs._native"
+python-source = "python"
+profile = "wheel"
+exclude = ["python/**/__pycache__/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["B", "I", "UP"]

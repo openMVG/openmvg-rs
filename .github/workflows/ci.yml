@@ -1,0 +1,371 @@
+# Pull requests and develop-branch pushes check the eight supported source crates.
+# Manual runs also qualify Python Rust bindings, Rerun, packages, and other interpreters.
+# Dataset acceptance runs remain a separate release requirement.
+
+name: CI
+
+on:
+  push:
+    branches: [develop, 'develop_*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  # Lint, docs, tests, and examples run as parallel jobs: their builds share no artifacts, so a
+  # single job would pay for each in turn.
+  lint:
+    name: Lint and docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          cache: true
+
+      # Dependencies only; pull requests restore the cache, pushes and manual runs save it.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: pixi run --locked {0}
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Check formatting
+        run: pixi run --locked cargo fmt --all -- --check
+
+      # Keep unstable-internals off so the stable SfM facade's visibility lint runs.
+      - name: Lint supported crates
+        run: >
+          pixi run --locked cargo clippy --locked --all-targets
+          --features openmvg/full,openmvg-sfm/console-progress,openmvg-cli/tui -- -D warnings
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: >
+          pixi run --locked cargo doc --locked --no-deps
+          --features openmvg/full,openmvg-sfm/console-progress
+
+      # Links to items behind a feature must still resolve when the feature is off.
+      - name: Check documentation without default features
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          for crate in openmvg-core openmvg-geometry openmvg-ba openmvg-sfm openmvg-io openmvg; do
+            pixi run --locked cargo doc --locked --no-deps -p "$crate" --no-default-features
+          done
+          pixi run --locked cargo doc --locked --no-deps -p openmvg-features --no-default-features --features libm
+
+      - name: Check architecture boundaries
+        run: pixi run --locked architecture
+
+      - name: Check algorithm module diagrams
+        run: pixi run --locked algorithm-docs
+
+      - name: Check crate roots, examples and figures
+        run: pixi run --locked crate-docs
+
+      - name: Check dependency licenses
+        run: pixi run --locked deny
+
+      - name: Check Rerun stays out of the root lockfile
+        run: |
+          if grep -Eq '^name = "re_(sdk|sdk_types)"$' Cargo.lock; then
+            echo "Rerun leaked into the root workspace lockfile" >&2
+            exit 1
+          fi
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          cache: true
+
+      # Dependencies only; pull requests restore the cache, pushes and manual runs save it.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: pixi run --locked {0}
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      # Enable the public crates' integration-test features explicitly.
+      - name: Test supported crates
+        run: >
+          pixi run --locked cargo test --locked
+          --features openmvg/full,openmvg-sfm/console-progress,openmvg-sfm/unstable-test-support,openmvg-geometry/unstable-test-support,openmvg-ba/unstable-internals,openmvg-cli/tui
+
+  # File handling differs on Windows: a directory with an open file cannot be renamed, and some
+  # editors start text files with a byte order mark. This job runs the crates that read and write
+  # files, then the command-line program on Sceaux Castle, whose OMVG output must validate.
+  windows:
+    name: Windows files
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          cache: true
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: pixi run --locked {0}
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Test the file-handling crates
+        run: >
+          pixi run --locked cargo test --locked -p openmvg-io -p openmvg-cli
+          -p openmvg-sfm --features openmvg-sfm/image-io
+
+      - name: Reconstruct Sceaux Castle with the command-line program
+        run: >
+          pixi run --locked python -I scripts/sceaux.py
+          cargo run --locked -p openmvg-cli --bin openmvg-sfm --
+          --output sfm_windows --colmap --no-progress
+
+      - name: Validate the OMVG output
+        run: >
+          pixi run --locked cargo run --locked -p openmvg-io --bin omvg --
+          validate sfm_windows/reconstruction.omvg
+
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          cache: true
+
+      # Dependencies only; pull requests restore the cache, pushes and manual runs save it.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: pixi run --locked {0}
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Run the synthetic examples
+        run: pixi run --locked examples
+
+  portability:
+    name: WASM, no_std & MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          cache: true
+
+      # Dependencies only; pull requests restore the cache, pushes and manual runs save it.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: pixi run --locked {0}
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      # Separate invocations prevent feature unification from masking missing backends.
+      - name: Check serial WASM profiles
+        run: |
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg-core --no-default-features
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg-geometry --no-default-features --features faer
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg-ba --no-default-features
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg-sfm --no-default-features
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg-io
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg --no-default-features --features sfm-image-io,io
+
+      - name: Build the size-optimized WASM profile
+        run: pixi run --locked cargo build --locked --profile wasm-release --target wasm32-unknown-unknown -p openmvg --no-default-features --features sfm
+
+      - name: Check no_std + alloc profile
+        run: |
+          pixi run --locked cargo clippy --locked -p openmvg-features --no-default-features --features libm -- -D warnings
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg-features --no-default-features --features libm
+
+      - name: Check declared MSRV
+        run: |
+          pixi run --locked -e msrv msrv-cargo check --locked --all-targets --features openmvg/full,openmvg-sfm/console-progress,openmvg-cli/tui
+          pixi run --locked -e msrv msrv-cargo check --locked -p openmvg-ba --no-default-features
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          cache: true
+          environments: python
+
+      # Dependencies only; pull requests restore the cache, pushes and manual runs save it.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: pixi run --locked -e python {0}
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.cache/openmvg-rs-tests
+          key: sceaux-${{ hashFiles('scripts/sceaux.sha256') }}
+
+      - name: Lint and type-check Python
+        run: pixi run --locked -e python py-lint
+
+      - name: Generate third-party licenses
+        run: pixi run --locked -e python py-notices
+
+      - name: Test on CPython 3.14
+        run: pixi run --locked -e python py-test
+
+      # py-test already built the extension in this environment.
+      - name: Check the stub against the module
+        run: pixi run --locked -e python --skip-deps py-stubtest
+
+  qualification:
+    name: Extended qualification
+    if: github.event_name == 'workflow_dispatch'
+    needs: [lint, test, examples, portability, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Reclaim the preinstalled toolchains first.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h
+
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          cache: true
+          environments: default msrv python-311 python-ft
+
+      # Dependencies only; pull requests restore the cache, pushes and manual runs save it.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: pixi run --locked {0}
+          save-if: ${{ github.event_name != 'pull_request' }}
+          workspaces: |
+            . -> target
+            crates/openmvg-rerun -> crates/openmvg-rerun/target
+
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.cache/openmvg-rs-tests
+          key: sceaux-${{ hashFiles('scripts/sceaux.sha256') }}
+
+      - name: Check workspace including Python bindings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          pixi run --locked cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          pixi run --locked cargo test --locked --workspace
+          pixi run --locked cargo doc --locked --workspace --no-deps --all-features
+
+      - name: Test additional feature profiles
+        run: |
+          pixi run --locked cargo test --locked -p openmvg-core --all-features
+          pixi run --locked cargo test --locked -p openmvg-geometry --no-default-features
+          pixi run --locked cargo test --locked -p openmvg-geometry --all-features
+          pixi run --locked cargo test --locked -p openmvg-ba --all-features
+          pixi run --locked cargo test --locked -p openmvg-geometry --release
+          pixi run --locked cargo clippy --locked -p openmvg-sfm --all-targets --no-default-features -- -D warnings
+
+      - name: Check native feature floors
+        run: |
+          pixi run --locked cargo check --locked -p openmvg-sfm --no-default-features --all-targets
+          pixi run --locked cargo check --locked -p openmvg-sfm --no-default-features --features image-io
+          pixi run --locked cargo check --locked -p openmvg --no-default-features --features sfm
+          pixi run --locked cargo check --locked -p openmvg --no-default-features --features sfm-image-io
+          pixi run --locked cargo check --locked -p openmvg --no-default-features --features sfm,parallel
+          pixi run --locked cargo check --locked -p openmvg --no-default-features --features io
+
+      - name: Check additional WASM profiles
+        run: |
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg-core -p openmvg-geometry -p openmvg-features
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg --no-default-features
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg --no-default-features --features faer
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg-sfm --no-default-features --features image-io
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg --no-default-features --features sfm
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg --no-default-features --features sfm-image-io
+          pixi run --locked cargo check --locked --target wasm32-unknown-unknown -p openmvg --no-default-features --features io
+          pixi run --locked cargo clippy --locked --target wasm32-unknown-unknown -p openmvg-features --no-default-features --features libm -- -D warnings
+
+      - name: Check additional MSRV profiles
+        run: |
+          pixi run --locked -e msrv msrv-cargo check --locked -p openmvg-core --all-features
+          pixi run --locked -e msrv msrv-cargo check --locked -p openmvg-geometry --all-features
+          pixi run --locked -e msrv msrv-cargo check --locked -p openmvg-sfm --all-features
+          pixi run --locked -e msrv msrv-cargo check --locked -p openmvg-io --all-features
+          pixi run --locked -e msrv msrv-cargo check --locked -p openmvg-ba --all-targets --all-features
+          pixi run --locked -e msrv msrv-cargo check --locked -p openmvg-cli --all-targets
+
+      - name: Check Rerun adapter
+        run: |
+          pixi run --locked cargo fmt --manifest-path crates/openmvg-rerun/Cargo.toml -- --check
+          pixi run --locked cargo clippy --locked --manifest-path crates/openmvg-rerun/Cargo.toml --all-targets -- -D warnings
+          pixi run --locked cargo test --locked --manifest-path crates/openmvg-rerun/Cargo.toml
+          pixi run --locked -e msrv msrv-cargo check --locked --manifest-path crates/openmvg-rerun/Cargo.toml --all-targets
+
+      # Match each crate's package.metadata.docs.rs profile.
+      - name: Check docs.rs profiles
+        env:
+          RUSTC_BOOTSTRAP: "1"
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        run: |
+          pixi run --locked cargo doc --locked --no-deps -p openmvg-core
+          pixi run --locked cargo doc --locked --no-deps -p openmvg-geometry --features faer,parallel
+          pixi run --locked cargo doc --locked --no-deps -p openmvg-features --features std,parallel
+          pixi run --locked cargo doc --locked --no-deps -p openmvg-ba --features faer,parallel
+          pixi run --locked cargo doc --locked --no-deps -p openmvg-sfm --features parallel,image-io,observer,console-progress
+          pixi run --locked cargo doc --locked --no-deps -p openmvg-io
+          pixi run --locked cargo doc --locked --no-deps -p openmvg --features full
+
+      - name: Verify packages
+        run: |
+          pixi run --locked cargo package --locked -p openmvg-core -p openmvg-geometry -p openmvg-features \
+            -p openmvg-ba -p openmvg-sfm -p openmvg-io -p openmvg -p openmvg-cli
+
+      - name: Test on CPython 3.11
+        run: pixi run --locked -e python-311 py-test
+
+      # Importing the extension must leave the free-threaded interpreter's GIL disabled.
+      - name: Test on free-threaded CPython 3.14
+        run: pixi run --locked -e python-ft py-test

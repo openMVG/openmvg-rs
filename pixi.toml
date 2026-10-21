@@ -1,0 +1,109 @@
+[workspace]
+authors = ["Pierre Moulon <pmoulon@gmail.com>"]
+channels = ["conda-forge"]
+name = "openmvg"
+platforms = ["win-64", "linux-64", "osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+run = "cargo run"
+build = "cargo build"
+clean = "cargo clean"
+fmt = "cargo fmt"
+test = "cargo test"
+test-global-cleanup-adversarial = "cargo test --locked -p openmvg-sfm --lib post_fixed_rotation_cleanup_tests"
+doc = "cargo doc"
+cargo = "cargo"
+architecture = "python scripts/check_architecture.py"
+algorithm-docs = "python -I scripts/check_algorithm_docs.py"
+crate-docs = "python -I scripts/check_crate_docs.py"
+# The crate examples, which check their own results: synthetic ones, and those on the Sceaux
+# Castle images, fetched and verified by scripts/sceaux.py.
+examples = "python -I scripts/run_examples.py"
+examples-real = "python -I scripts/run_examples.py --real"
+deny = "cargo deny --locked check licenses"
+# The openmvg-cli programs: `pixi run openmvg-sfm path/to/images`, and the project configurator
+# for `openmvg-sfm --project`, `pixi run sfm-configure path/to/images`.
+openmvg-sfm = "cargo run --release -p openmvg-cli --bin openmvg-sfm --"
+sfm-configure = "cargo run --release -p openmvg-cli --features tui --bin openmvg-sfm-configure --"
+
+[dependencies]
+rust = ">=1.99.0,<1.100"
+pkg-config = "*"
+python = ">=3.11"
+rust-std-wasm32-unknown-unknown = ">=1.99.0,<1.100"
+cargo-deny = ">=0.20.2,<0.21"
+
+[target.linux-64.dependencies]
+mold = ">=2.0"
+
+# Link with mold, which the environment provides. It is set here rather than in .cargo/config.toml,
+# so builds outside pixi use the platform linker; Cargo adds these flags to that file's.
+[target.linux-64.activation.env]
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold"
+
+# The declared MSRV (`rust-version`) of every crate, the Rerun adapter included.
+[feature.msrv.dependencies]
+rust = ">=1.97.0,<1.98"
+
+[feature.msrv.target.linux-64.dependencies]
+mold = ">=2.0"
+
+[feature.msrv.target.linux-64.activation.env]
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold"
+
+# The msrv environment excludes the default feature (its Rust 1.99 conflicts
+# with the MSRV toolchain), so it does not inherit the top-level tasks.
+# The alias carries a unique name on purpose: reusing `cargo` makes bare
+# `pixi run cargo` ambiguous on Pixi 0.83+ (default, msrv, python and
+# python-311 would all provide it), breaking every step that relies on the
+# default environment. Invoke it only with `-e msrv`.
+[feature.msrv.tasks]
+msrv-cargo = "cargo"
+
+# Python bindings (bindings/python): build with maturin, test with pytest.
+[feature.python.dependencies]
+maturin = ">=1.15,<2"
+pip = "*"
+pytest = ">=8"
+pillow = ">=10"
+numpy = ">=1.26"
+
+[feature.python.tasks]
+py-build = "maturin develop --locked --release --manifest-path bindings/python/Cargo.toml"
+py-example = "cargo build --locked --release -p openmvg --example sfm --no-default-features --features sfm-image-io,io,parallel"
+py-test = { cmd = "pytest bindings/python/tests", depends-on = ["py-build", "py-example"], env = { OPENMVG_SFM_EXAMPLE = "target/release/examples/sfm" } }
+
+[feature.python-lint.dependencies]
+mypy = ">=1.15"
+ruff = ">=0.11"
+cargo-about = ">=0.9.2,<0.10"
+
+[feature.python-lint.tasks]
+py-lint = "ruff check bindings/python scripts docs/format/reference && ruff format --check bindings/python scripts docs/format/reference && mypy --strict bindings/python/python/openmvg_rs"
+py-stubtest = { cmd = "python -m mypy.stubtest openmvg_rs", depends-on = ["py-build"] }
+py-notices = "cargo about generate --locked --manifest-path bindings/python/Cargo.toml --config bindings/python/about.toml --fail --output-file bindings/python/THIRD_PARTY_LICENSES.txt bindings/python/about.hbs && test -s bindings/python/THIRD_PARTY_LICENSES.txt"
+
+[feature.py311.dependencies]
+python = "3.11.*"
+
+[feature.py314.dependencies]
+python = "3.14.*"
+
+# Free-threaded CPython; carries its own toolchain so the default feature's packages stay out.
+[feature.python-ft.dependencies]
+python-freethreading = "3.14.*"
+rust = ">=1.99.0,<1.100"
+pkg-config = "*"
+
+[feature.python-ft.target.linux-64.dependencies]
+mold = ">=2.0"
+
+[feature.python-ft.target.linux-64.activation.env]
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold"
+
+[environments]
+msrv = { features = ["msrv"], no-default-feature = true }
+python = ["python", "python-lint", "py314"]
+python-311 = ["python", "py311"]
+python-ft = { features = ["python", "python-ft"], no-default-feature = true }

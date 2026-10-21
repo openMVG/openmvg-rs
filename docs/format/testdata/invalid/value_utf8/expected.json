@@ -1,0 +1,4 @@
+{
+  "rule": "value.utf8",
+  "description": "an image path is not valid UTF-8"
+}

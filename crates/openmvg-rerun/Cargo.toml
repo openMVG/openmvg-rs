@@ -1,0 +1,38 @@
+[package]
+name = "openmvg-rerun"
+description = "Optional Rerun visualization adapter for OpenMVG SfM pipelines"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/openMVG/openmvg-rs"
+readme = "README.md"
+publish = false
+
+# Standalone workspace: the re_sdk dependency tree stays out of the root workspace
+# and its lockfile. Build with
+# `--manifest-path crates/openmvg-rerun/Cargo.toml`.
+[workspace]
+
+[dependencies]
+openmvg-core = { path = "../openmvg-core" }
+openmvg-sfm = { path = "../openmvg-sfm", default-features = false, features = ["observer"] }
+re_sdk = { version = "=0.36.3", default-features = false }
+re_sdk_types = { version = "=0.36.3", default-features = false }
+thiserror = "1.0"
+
+[dev-dependencies]
+nalgebra = { version = "0.35", features = ["serde-serialize"] }
+openmvg-features = { path = "../openmvg-features", default-features = false, features = ["std"] }
+openmvg-sfm = { path = "../openmvg-sfm", default-features = false, features = ["unstable-test-support", "image-io", "parallel"] }
+tempfile = "3.8"
+
+[[example]]
+name = "record_sfm"
+
+# Mirrors the root workspace profiles, which do not apply to this workspace.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,4 @@
+{
+  "rule": "value.list_null",
+  "description": "a rotation element is null"
+}

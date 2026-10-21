@@ -1,0 +1,119 @@
+[workspace]
+members = [
+    "crates/openmvg-core",
+    "crates/openmvg-geometry",
+    "crates/openmvg-features",
+    "crates/openmvg-ba",
+    "crates/openmvg",
+    "crates/openmvg-sfm",
+    "crates/openmvg-io",
+    "crates/openmvg-cli",
+    "bindings/python",
+]
+# The Rerun adapter has its own workspace and lockfile so the re_sdk dependency
+# tree stays out of this lockfile; build it with
+# `--manifest-path crates/openmvg-rerun/Cargo.toml`.
+exclude = ["crates/openmvg-rerun"]
+# Ordinary root builds cover only the supported v0.1 source-release crates.
+# Python bindings remain an explicit workspace member.
+default-members = [
+    "crates/openmvg-core",
+    "crates/openmvg-geometry",
+    "crates/openmvg-features",
+    "crates/openmvg-ba",
+    "crates/openmvg",
+    "crates/openmvg-sfm",
+    "crates/openmvg-io",
+    "crates/openmvg-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/openMVG/openmvg-rs"
+
+[workspace.dependencies]
+# Core dependencies
+nalgebra = { version = "0.35", features = ["serde-serialize"] }
+faer = { version = "0.24.4", default-features = false }
+thiserror = "1.0"
+rand = { version = "0.8", default-features = false, features = ["alloc", "std_rng", "small_rng"] }
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+rand_distr = { version = "0.4", default-features = false, features = ["alloc"] }
+num-traits = "0.2"
+rayon = "1.8"
+crossbeam-utils = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+sha2 = "0.10"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+roots = "0.0.8"
+tempfile = "3.8"
+criterion = { version = "0.5", default-features = false }
+proptest = "1.4"
+approx = "0.5"
+arrayvec = "0.7"
+indicatif = "0.18"
+pulp = { version = "0.22.2", default-features = false, features = ["std", "x86-v3"] }
+
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
+kamadak-exif = "0.6"
+
+# Command-line tools, in openmvg-cli only; the terminal UI stack only behind its `tui` feature
+clap = { version = "4.4", features = ["derive"] }
+ratatui = "0.30"
+# No chafa: its default feature links a native library.
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
+
+# OMVG community format, in openmvg-io only: pure Rust, Snappy as the only codec
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
+arrow-array = { version = "60", default-features = false }
+arrow-schema = { version = "60", default-features = false }
+arrow-select = { version = "60", default-features = false }
+
+# Workspace crates
+# Intra-workspace crates are pinned exactly and the eight supported crates release together.
+openmvg-core = { path = "crates/openmvg-core", version = "=0.1.0" }
+openmvg-geometry = { path = "crates/openmvg-geometry", version = "=0.1.0", default-features = false }
+openmvg-features = { path = "crates/openmvg-features", version = "=0.1.0", default-features = false }
+openmvg-ba = { path = "crates/openmvg-ba", version = "=0.1.0", default-features = false }
+openmvg-sfm = { path = "crates/openmvg-sfm", version = "=0.1.0", default-features = false }
+openmvg-io = { path = "crates/openmvg-io", version = "=0.1.0", default-features = false }
+
+[profile.dev]
+opt-level = 1
+split-debuginfo = "unpacked"
+
+# Compile external dependencies at full optimisation even in dev builds.
+# This avoids the severe slowdown from unoptimised nalgebra/rayon/faer in
+# debug iterations, while keeping incremental rebuilds of workspace crates fast.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
+
+# Python wheels use fat LTO and one codegen unit (`maturin build --profile wheel`).
+# Keep unwinding enabled for PyO3's conversion of Rust panics into Python exceptions.
+[profile.wheel]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# Size-optimized wasm32 artifacts built from this workspace (`--profile wasm-release`). Cargo
+# ignores the profiles of dependencies, so a downstream application keeps its own.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

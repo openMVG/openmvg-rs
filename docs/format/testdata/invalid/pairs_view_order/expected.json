@@ -1,0 +1,4 @@
+{
+  "rule": "pairs.view_order",
+  "description": "a pair has view_first > view_second"
+}

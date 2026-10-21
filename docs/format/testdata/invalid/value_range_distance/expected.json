@@ -1,0 +1,4 @@
+{
+  "rule": "value.range",
+  "description": "a match distance is negative"
+}

@@ -1,0 +1,4 @@
+{
+  "rule": "pairs.matrix_zero",
+  "description": "a homography matrix is all zero"
+}

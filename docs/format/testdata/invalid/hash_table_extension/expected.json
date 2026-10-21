@@ -1,0 +1,4 @@
+{
+  "rule": "hash.table",
+  "description": "a value of an unknown extension table changed after it was hashed"
+}

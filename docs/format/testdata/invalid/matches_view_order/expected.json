@@ -1,0 +1,4 @@
+{
+  "rule": "matches.view_order",
+  "description": "a match has view_first > view_second"
+}

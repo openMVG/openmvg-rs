@@ -1,0 +1,4 @@
+{
+  "rule": "rotation",
+  "description": "a ground-truth rotation is a reflection (det -1)"
+}

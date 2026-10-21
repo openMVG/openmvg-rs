@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.member",
+  "description": "content_hash is absent"
+}

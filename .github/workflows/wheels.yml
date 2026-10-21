@@ -1,0 +1,268 @@
+# Release wheels and the source distribution of the openmvg-rs Python package, built on demand.
+# They are uploaded as run artefacts, and the `publish` input can also upload them to TestPyPI
+# or PyPI once every build and test has passed (the default, `none`, publishes nothing).
+#
+# Every wheel uses the stable ABI (cp311-abi3), the `wheel` profile that pyproject.toml selects
+# (fat LTO, one codegen unit) and ships the generated THIRD_PARTY_LICENSES.txt. Wheels link with
+# the platform compiler: the repository's `.cargo/config.toml` holds only the x86-64-v2 target of
+# x86-64 Linux, which Windows gets from the environment below, and the mold linker of the
+# developer setup comes from pixi alone. Each wheel is built on its own platform, then
+# installed into a clean CPython 3.11 and passes the contract tests; the x86-64 Linux wheel also
+# runs the tests that execute native code under `qemu -cpu Nehalem`, the oldest x86-64-v2 CPU.
+# The sdist serves every other Python
+# (free-threaded builds, which the stable ABI excludes until abi3t) and platform; pip builds it
+# with the same profile, and the job proves that on free-threaded CPython 3.14.
+
+name: Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Where to upload the wheels and the sdist after every job passes
+        type: choice
+        options: [none, testpypi, pypi]
+        default: none
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  notices:
+    name: Third-party licences
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          cache: true
+          environments: python
+
+      - name: Generate third-party licences
+        run: pixi run --locked -e python py-notices
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: notices
+          path: bindings/python/THIRD_PARTY_LICENSES.txt
+          if-no-files-found: error
+
+  wheel:
+    name: ${{ matrix.name }}
+    needs: notices
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64
+            manylinux: "2014"
+            emulate: qemu-x86_64-static -cpu Nehalem
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: "2014"
+          - name: macos-arm64
+            runner: macos-14
+            target: aarch64
+          - name: windows-x64
+            runner: windows-latest
+            target: x64
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-cpu=x86-64-v2
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: notices
+          path: bindings/python
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'off' }}
+          args: --locked --out dist
+
+      # maturin silently leaves out a missing licence file.
+      - name: Check the wheel ships the licence files
+        shell: python
+        run: |
+          import pathlib, zipfile
+          (wheel,) = pathlib.Path("bindings/python/dist").glob("*.whl")
+          names = {pathlib.PurePosixPath(n).name for n in zipfile.ZipFile(wheel).namelist()
+                   if ".dist-info/licenses/" in n}
+          missing = {"LICENSE-APACHE", "LICENSE-MIT", "THIRD_PARTY_LICENSES.txt"} - names
+          assert not missing, f"{wheel.name} lacks {sorted(missing)}"
+          assert "-cp311-abi3-" in wheel.name, wheel.name
+
+      - name: Install the wheel and the test dependencies
+        shell: bash
+        run: python -m pip install bindings/python/dist/*.whl pytest numpy pillow
+
+      - name: Inspect the manylinux tags
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install auditwheel
+          auditwheel show bindings/python/dist/*.whl
+
+      # The comparison with the Rust example needs a cargo build; the CI python job runs it.
+      - name: Run the contract tests
+        shell: bash
+        run: >
+          python -m pytest bindings/python/tests -p no:cacheprovider
+          -k "not test_matches_the_rust_example"
+
+      - name: Install qemu
+        if: matrix.emulate
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+
+      # On the oldest x86-64-v2 CPU, the tests that run native code: both engines on real images,
+      # and the geometry estimators. An instruction newer than the wheels' baseline faults here.
+      # Emulation is about 20 times slower, so the rest of the suite runs natively above.
+      - name: Run the native paths on the baseline CPU
+        if: matrix.emulate
+        shell: bash
+        run: >
+          ${{ matrix.emulate }} "$(python -c 'import sys; print(sys.executable)')"
+          -m pytest bindings/python/tests/test_sceaux.py bindings/python/tests/test_geometry.py
+          -p no:cacheprovider -k "not test_matches_the_rust_example"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-${{ matrix.name }}
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: sdist
+    needs: notices
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: notices
+          path: bindings/python
+
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+
+      - name: Check the sdist ships the licence files
+        shell: python
+        run: |
+          import pathlib, tarfile
+          (sdist,) = pathlib.Path("bindings/python/dist").glob("*.tar.gz")
+          names = {pathlib.PurePosixPath(n).name for n in tarfile.open(sdist).getnames()}
+          missing = {"LICENSE-APACHE", "LICENSE-MIT", "THIRD_PARTY_LICENSES.txt"} - names
+          assert not missing, f"{sdist.name} lacks {sorted(missing)}"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14t"
+
+      # maturin trims the workspace in the sdist to the crates the bindings use but ships the whole
+      # Cargo.lock, so Cargo prunes it and `--locked` would refuse. Pruning keeps every version: this
+      # checks that each package the sdist resolves is pinned, at that version, by the shipped lock.
+      - name: Check the sdist resolves only locked packages
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: |
+          mkdir sdist-lock && tar xzf "$GITHUB_WORKSPACE"/bindings/python/dist/*.tar.gz -C sdist-lock
+          cd sdist-lock/*/
+          cp Cargo.lock shipped.lock
+          cargo metadata --format-version 1 > /dev/null
+          python - <<'EOF'
+          import tomllib
+
+          def packages(path):
+              with open(path, "rb") as lock:
+                  return {(p["name"], p["version"], p.get("source")) for p in tomllib.load(lock)["package"]}
+
+          shipped, resolved = packages("shipped.lock"), packages("Cargo.lock")
+          unpinned = sorted(resolved - shipped)
+          assert not unpinned, f"the sdist resolves packages its Cargo.lock does not pin: {unpinned}"
+          print(f"{len(resolved)} resolved packages, all pinned by the shipped lock of {len(shipped)}")
+          EOF
+
+      # Built outside the repository, so the repository's `.cargo/config.toml` plays no part. The
+      # check greps Cargo's output, which the workflow's CARGO_TERM_COLOR would break up with color
+      # codes.
+      - name: Build and install from the sdist
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: >
+          python -m pip install -v "$GITHUB_WORKSPACE"/bindings/python/dist/*.tar.gz
+          pytest numpy pillow 2>&1 | tee build.log
+          && grep -qF 'Finished `wheel` profile' build.log
+
+      - name: Run the contract tests
+        run: >
+          python -m pytest bindings/python/tests -p no:cacheprovider
+          -k "not test_matches_the_rust_example"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdist
+          path: bindings/python/dist/*.tar.gz
+          if-no-files-found: error
+
+  # Trusted Publishing: PyPI and TestPyPI accept the upload from this workflow and environment,
+  # registered as the project's trusted publisher, so no token is stored. The `pypi` and
+  # `testpypi` environments are where to require a reviewer before anything is uploaded.
+  publish:
+    name: Publish to ${{ inputs.publish }}
+    needs: [wheel, sdist]
+    if: inputs.publish != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ inputs.publish }}
+      url: ${{ inputs.publish == 'pypi' && 'https://pypi.org/project/openmvg-rs/' || 'https://test.pypi.org/project/openmvg-rs/' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sdist
+          path: dist
+
+      - name: List the files to upload
+        run: ls -l dist
+
+      # The action checks the metadata of every file (twine check) and attaches attestations.
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: ${{ inputs.publish == 'testpypi' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}

@@ -1,0 +1,4 @@
+{
+  "rule": "manifest.extensions",
+  "description": "extensions_required is not a subset of extensions_used"
+}

@@ -1,0 +1,4 @@
+{
+  "rule": "schema.column_name",
+  "description": "an extra column name contains a dot"
+}

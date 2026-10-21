@@ -1,0 +1,4 @@
+{
+  "rule": "parquet.type",
+  "description": "an ID column is unsigned"
+}

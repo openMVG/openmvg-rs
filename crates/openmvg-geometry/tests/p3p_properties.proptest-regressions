@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0a903aaffb3776c52514d34a83d10efbd5b29050fafa30b2b47b7011ee1546e5 # shrinks to rotation_vector = [-0.491244181031524, 0.3536248733370885, -0.995324521187938], translation = [0.0, 0.0, -0.4858850160579738], scale_log2 = 0, perturbation = [-0.10073548610877935, 0.212785764528469, 0.19381224292201946], permutation_index = 0
+cc 725318f361538537b7992f97a60e28ff67885aa11bae3935013719410a411e9d # shrinks to rotation_vector = [0.0, 0.0, 0.0], translation = [0.0, 0.0, 0.0], scale_log2 = 0, perturbation = [-0.14262554521090876, 0.06814316812184577, 0.07380662324243381], permutation_index = 0

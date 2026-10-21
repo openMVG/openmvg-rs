@@ -1,0 +1,4 @@
+{
+  "rule": "value.non_finite",
+  "description": "a coordinate is NaN"
+}

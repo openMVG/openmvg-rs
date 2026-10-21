@@ -1,0 +1,4 @@
+{
+  "rule": "parquet.type",
+  "description": "an extra column is a struct with one field"
+}
