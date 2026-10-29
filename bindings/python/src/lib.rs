@@ -21,7 +21,8 @@ use std::time::Duration;
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2};
 use openmvg_core::camera::{
-    Camera, FisheyeDistortion, PinholeCamera, RadialDistortion, TangentialDistortion,
+    Camera, CameraModelType, FisheyeDistortion, PinholeCamera, RadialDistortion,
+    TangentialDistortion,
 };
 use openmvg_sfm::progress::{ConsoleProgress, SfmProgressSink, SfmProgressStage};
 use openmvg_sfm::{
@@ -295,7 +296,17 @@ fn run_interruptibly<T: Send>(
 // One parameter per keyword argument of the Python `reconstruct`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (image_dir, engine, seed, intrinsics, progress, max_workers, extraction_method = "alp"))]
+#[pyo3(signature = (
+    image_dir,
+    engine,
+    seed,
+    intrinsics,
+    progress,
+    max_workers,
+    extraction_method = "alp",
+    camera_model = "pinhole-radial1",
+    share_intrinsics = false,
+))]
 fn reconstruct(
     py: Python<'_>,
     image_dir: PathBuf,
@@ -305,6 +316,8 @@ fn reconstruct(
     progress: bool,
     max_workers: Option<usize>,
     extraction_method: &str,
+    camera_model: &str,
+    share_intrinsics: bool,
 ) -> PyResult<Reconstruction> {
     let engine = Engine::parse(engine)?;
     let extraction_method = match extraction_method {
@@ -316,6 +329,19 @@ fn reconstruct(
             ));
         }
     };
+    // The names of the `openmvg-sfm --camera-model` values.
+    let camera_model = match camera_model {
+        "pinhole" => CameraModelType::PinholeSingle,
+        "pinhole-radial1" => CameraModelType::PinholeRadial1,
+        "pinhole-radial2" => CameraModelType::PinholeRadial2,
+        "spherical" => CameraModelType::Spherical,
+        _ => {
+            return Err(PyValueError::new_err(
+                "camera_model must be 'pinhole', 'pinhole-radial1', 'pinhole-radial2' or \
+                 'spherical'",
+            ));
+        }
+    };
     let canceled = AtomicBool::new(false);
     let sink = Progress {
         console: progress.then(ConsoleProgress::stderr),
@@ -323,7 +349,10 @@ fn reconstruct(
     };
 
     let work = || -> Result<openmvg_sfm::Reconstruction, Failure> {
-        let mut options = DatasetConfig::default().with_seed(seed.into());
+        let mut options = DatasetConfig::default()
+            .with_seed(seed.into())
+            .with_camera_model(camera_model)
+            .with_share_unknown_cameras(share_intrinsics);
         if let Some(path) = &intrinsics {
             options = options.with_intrinsics(path);
         }
