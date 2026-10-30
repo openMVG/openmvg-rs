@@ -122,6 +122,31 @@ def test_without_calibration_the_intrinsics_are_estimated(scene: Path) -> None:
     assert result.num_registered_images == VIEWS
 
 
+def test_images_without_exif_share_one_camera_on_request(scene: Path) -> None:
+    (scene / "K.txt").unlink()
+    separate = reconstruct(scene, progress=False)
+    assert len({id(view.camera) for view in separate.views}) == separate.num_registered_images
+
+    shared = reconstruct(
+        scene, share_intrinsics=True, camera_model="pinhole-radial2", progress=False
+    )
+    assert shared.intrinsics_mode == "estimated"
+    assert shared.num_registered_images == VIEWS
+    camera = shared.views[0].camera
+    assert all(view.camera is camera for view in shared.views)
+    assert camera.model == "BROWN_CONRADY"
+    assert {"k1", "k2"} <= dict(camera.parameters).keys()
+
+
+def test_k_file_takes_precedence_over_shared_intrinsics(scene: Path, tmp_path: Path) -> None:
+    result = reconstruct(
+        scene, share_intrinsics=True, camera_model="pinhole-radial2", progress=False
+    )
+    assert result.intrinsics_mode == "fixed"
+    result.write_colmap(tmp_path / "out")
+    assert camera_focals(tmp_path / "out") == {f"{FOCAL:g}"}
+
+
 def test_k_file_takes_precedence_over_exif(scene: Path, tmp_path: Path) -> None:
     exif = Image.Exif()
     exif.get_ifd(0x8769)[0xA405] = 50  # FocalLengthIn35mmFilm, far from the K.txt focal

@@ -104,6 +104,11 @@ def test_free_threaded_build_keeps_the_gil_disabled() -> None:
         ({"seed": "42"}, TypeError),
         ({"intrinsics": b"K.txt"}, TypeError),
         ({"intrinsics": 3}, TypeError),
+        ({"camera_model": "radial"}, ValueError),
+        ({"camera_model": "PINHOLE"}, ValueError),
+        ({"camera_model": None}, TypeError),
+        ({"share_intrinsics": 1}, TypeError),
+        ({"share_intrinsics": None}, TypeError),
         ({"progress": 1}, TypeError),
         ({"progress": None}, TypeError),
         ({"max_workers": 0}, ValueError),
@@ -133,14 +138,27 @@ def test_extraction_method_is_forwarded_without_changing_other_options(
         reconstruct(tmp_path, extraction_method=method, seed=7, progress=False, max_workers=1)
         is result
     )
-    assert calls == [(str(tmp_path), "incremental", 7, None, False, 1, method)]
+    assert calls == [
+        (str(tmp_path), "incremental", 7, None, False, 1, method, "pinhole-radial1", False)
+    ]
 
 
 def test_extraction_default_is_named_alp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
     monkeypatch.setattr(openmvg_rs, "_reconstruct", lambda *args: calls.append(args))
     reconstruct(tmp_path, progress=False, max_workers=1)
-    assert calls[0][-1] == "alp"
+    assert calls[0][6] == "alp"
+
+
+@pytest.mark.parametrize("model", ["pinhole", "pinhole-radial1", "pinhole-radial2", "spherical"])
+@pytest.mark.parametrize("share", [False, True])
+def test_camera_options_are_forwarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str, share: bool
+) -> None:
+    calls = []
+    monkeypatch.setattr(openmvg_rs, "_reconstruct", lambda *args: calls.append(args))
+    reconstruct(tmp_path, camera_model=model, share_intrinsics=share, progress=False, max_workers=1)  # type: ignore[arg-type]
+    assert calls[0][7:] == (model, share)
 
 
 def test_image_dir_must_be_a_text_path(rendered: Path) -> None:

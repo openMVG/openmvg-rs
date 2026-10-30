@@ -150,6 +150,11 @@ fn from_dir_with_defaults_matches_from_dir() {
 
     assert_eq!(options.seed(), Dataset::DEFAULT_SEED.into());
     assert_eq!(options.intrinsics(), None);
+    assert_eq!(
+        options.camera_model(),
+        ImageDatasetConfig::default().camera_model()
+    );
+    assert!(!options.share_unknown_cameras());
     assert_eq!(defaults.root_seed(), discovered.root_seed());
     assert_eq!(defaults.views(), discovered.views());
     assert_eq!(defaults.camera_models(), discovered.camera_models());
@@ -200,6 +205,55 @@ fn from_dir_with_rejects_an_unusable_explicit_calibration() {
         Dataset::from_dir_with(root.path(), &malformed),
         Err(crate::SfmError::InvalidInput(_))
     ));
+}
+
+#[test]
+fn from_dir_with_shares_one_estimated_camera_between_unknown_images() {
+    let root = tempfile::TempDir::new().unwrap();
+    let paths = noise_images(root.path(), 3);
+
+    let options = DatasetConfig::default()
+        .with_share_unknown_cameras(true)
+        .with_camera_model(CameraModelType::PinholeRadial2);
+    let shared = Dataset::from_dir_with(root.path(), &options).unwrap();
+    let expected = prepare_image_paths(
+        &paths,
+        &ImageDatasetConfig::default()
+            .with_share_unknown_cameras(true)
+            .with_camera_model(CameraModelType::PinholeRadial2),
+    )
+    .unwrap()
+    .build_dataset(Dataset::DEFAULT_SEED)
+    .unwrap();
+
+    assert!(options.share_unknown_cameras());
+    assert_eq!(options.camera_model(), CameraModelType::PinholeRadial2);
+    assert!(!shared.has_calibrated_intrinsics());
+    assert_eq!(shared.camera_models().len(), 1);
+    assert_eq!(shared.camera_models(), expected.camera_models());
+    assert_eq!(shared.views(), expected.views());
+    assert_eq!(
+        shared.intrinsic_prior(crate::IntrinsicId::new(0)),
+        Some(crate::model::IntrinsicPrior::Guess)
+    );
+}
+
+#[test]
+fn from_dir_with_keeps_an_explicit_calibration_when_sharing_unknown_cameras() {
+    let root = tempfile::TempDir::new().unwrap();
+    noise_images(root.path(), 2);
+    std::fs::write(root.path().join("K.txt"), "100 0 48\n0 100 47\n0 0 1\n").unwrap();
+
+    let options = DatasetConfig::default()
+        .with_share_unknown_cameras(true)
+        .with_camera_model(CameraModelType::PinholeRadial2);
+    let dataset = Dataset::from_dir_with(root.path(), &options).unwrap();
+
+    assert!(dataset.has_calibrated_intrinsics());
+    assert_eq!(
+        dataset.camera_models(),
+        [Camera::try_pinhole(100.0, 100.0, 48.0, 47.0).unwrap()]
+    );
 }
 
 #[test]
