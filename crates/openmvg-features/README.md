@@ -34,6 +34,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The [crate documentation](https://docs.rs/openmvg-features) explains how to choose a detector,
 a descriptor storage and a matcher, and how each detector works.
 
+## Optional GPU SIFT
+
+Enable the `gpu` feature to run the SIFT detector on a wgpu device:
+
+```toml
+[dependencies]
+openmvg-features = { version = "0.1", features = ["gpu"] }
+```
+
+```rust,ignore
+use openmvg_features::extraction::{GrayImage, SiftGpuError, SiftGpuExtractor, SiftPreset};
+
+fn extract(image: &GrayImage) -> Result<(), Box<dyn std::error::Error>> {
+    let extractor = match SiftGpuExtractor::with_preset(SiftPreset::Normal) {
+        Ok(extractor) => extractor,
+        Err(SiftGpuError::NoAdapter) => return Ok(()), // fall back to `SiftExtractor`
+        Err(error) => return Err(error.into()),
+    };
+    let features = extractor.extract_u8(image)?;
+    assert_eq!(features.keypoints().len(), features.descriptors().len());
+    Ok(())
+}
+```
+
+The GPU extractor accepts the same `SiftExtractor` configuration and returns the same
+`ScaleSpaceFeatures`, with `detect_keypoints`, `extract_u8`, `extract_f32` and `extract_typed`.
+It is opt-in: default builds stay CPU-only and `no_std + alloc` builds are unchanged.
+
 ## License
 
 Licensed under either Apache-2.0 or MIT. See the repository license files.

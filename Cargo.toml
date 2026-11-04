@@ -60,6 +60,12 @@ arrayvec = "0.7"
 indicatif = "0.18"
 pulp = { version = "0.22.2", default-features = false, features = ["std", "x86-v3"] }
 
+# Optional GPU SIFT backend. Keep these out of default builds: wgpu is a large
+# dependency and the GPU path is selected explicitly with `--features gpu`.
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "1"
+wgpu = "30"
+
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 kamadak-exif = "0.6"
 
