@@ -490,10 +490,8 @@ impl Engine {
             .ok_or(RunError::Capacity { what: "input" })?;
         self.ensure_storage_capacity(source_bytes)?;
         let source = storage_buffer(&self.device, "omvg-sift-input", source_bytes as u64);
-        let mut normalized = Vec::with_capacity(height * width);
-        normalized.extend(image.as_slice().iter().map(|value| value * (1.0 / 255.0)));
         self.queue
-            .write_buffer(&source, 0, bytemuck::cast_slice(&normalized));
+            .write_buffer(&source, 0, bytemuck::cast_slice(image.as_slice()));
 
         let mut encoder = self
             .device
