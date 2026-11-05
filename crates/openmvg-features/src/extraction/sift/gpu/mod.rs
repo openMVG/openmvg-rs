@@ -272,6 +272,24 @@ struct Detection {
     octaves: Vec<Octave>,
 }
 
+struct OrientationReadback {
+    key_count: usize,
+    count_bytes: usize,
+    orientation_bytes: usize,
+    counts: wgpu::Buffer,
+    orientations: wgpu::Buffer,
+    indices: Vec<usize>,
+}
+
+struct DescriptorReadback {
+    key_count: usize,
+    valid_bytes: usize,
+    value_bytes: usize,
+    valid: wgpu::Buffer,
+    values: wgpu::Buffer,
+    feature_indices: Vec<usize>,
+}
+
 // =============================================================================
 // wgpu engine
 // =============================================================================
@@ -647,32 +665,36 @@ impl Engine {
         drop(keep_bind_groups);
         drop(keep_buffers);
 
-        let mut refined = Vec::new();
+        let mut count_ranges = Vec::with_capacity(num_octaves * 2);
         for octave in 0..num_octaves {
-            let capacity = capacities[octave];
-            let count_bytes = read_buffer(
-                &self.device,
-                &self.queue,
-                &candidate_counts[octave],
-                core::mem::size_of::<u32>(),
-            )?;
-            let candidate_count = read_u32(&count_bytes, 0) as usize;
-            let refined_bytes_read = read_buffer(
-                &self.device,
-                &self.queue,
-                &refined_counts[octave],
-                core::mem::size_of::<u32>(),
-            )?;
-            let refined_count = read_u32(&refined_bytes_read, 0) as usize;
-            if candidate_count > capacity || refined_count > capacity {
+            count_ranges.push((&candidate_counts[octave], core::mem::size_of::<u32>()));
+            count_ranges.push((&refined_counts[octave], core::mem::size_of::<u32>()));
+        }
+        let (count_data, count_offsets) = read_buffers(&self.device, &self.queue, &count_ranges)?;
+        let mut refined_totals = Vec::with_capacity(num_octaves);
+        for octave in 0..num_octaves {
+            let candidate_count = read_u32(&count_data, count_offsets[octave * 2]) as usize;
+            let refined_count = read_u32(&count_data, count_offsets[octave * 2 + 1]) as usize;
+            if candidate_count > capacities[octave] || refined_count > capacities[octave] {
                 return Err(RunError::Capacity { what: "candidate" });
             }
-            let bytes = read_buffer(
-                &self.device,
-                &self.queue,
+            refined_totals.push(refined_count);
+        }
+
+        let mut refined_ranges = Vec::with_capacity(num_octaves);
+        for octave in 0..num_octaves {
+            refined_ranges.push((
                 &refined_buffers[octave],
-                refined_count * REFINED_BYTES,
-            )?;
+                refined_totals[octave] * REFINED_BYTES,
+            ));
+        }
+        let (refined_data, refined_offsets) =
+            read_buffers(&self.device, &self.queue, &refined_ranges)?;
+        let mut refined = Vec::new();
+        for octave in 0..num_octaves {
+            let refined_count = refined_totals[octave];
+            let start = refined_offsets[octave];
+            let bytes = &refined_data[start..start + refined_count * REFINED_BYTES];
             let mut records = Vec::with_capacity(refined_count);
             for chunk in bytes.as_chunks::<REFINED_BYTES>().0 {
                 records.push(bytemuck::pod_read_unaligned::<GpuRefined>(chunk));
@@ -701,7 +723,7 @@ impl Engine {
 
         // Orientation is computed per octave, preserving the CPU's octave and
         // bin order. The host applies the feature budget after all octaves.
-        let mut oriented = Vec::new();
+        let mut orientation_readbacks = Vec::new();
         for (octave, octave_data) in octaves.iter().enumerate() {
             let mut keys = Vec::new();
             let mut indices = Vec::new();
@@ -809,16 +831,36 @@ impl Engine {
                 pass.dispatch_workgroups(key_count.div_ceil(32).max(1) as u32, 1, 1);
             }
             self.queue.submit(Some(encoder.finish()));
+            orientation_readbacks.push(OrientationReadback {
+                key_count,
+                count_bytes,
+                orientation_bytes,
+                counts,
+                orientations,
+                indices,
+            });
+        }
 
-            let count_readback = read_buffer(&self.device, &self.queue, &counts, count_bytes)?;
-            let orientation_readback =
-                read_buffer(&self.device, &self.queue, &orientations, orientation_bytes)?;
-            for (local, &index) in indices.iter().enumerate() {
-                let count = read_u32(&count_readback, local * 4) as usize;
+        let mut orientation_ranges = Vec::with_capacity(orientation_readbacks.len() * 2);
+        for readback in &orientation_readbacks {
+            orientation_ranges.push((&readback.counts, readback.count_bytes));
+            orientation_ranges.push((&readback.orientations, readback.orientation_bytes));
+        }
+        let (orientation_data, orientation_offsets) =
+            read_buffers(&self.device, &self.queue, &orientation_ranges)?;
+        let mut oriented = Vec::new();
+        for (readback, offsets) in orientation_readbacks
+            .iter()
+            .zip(orientation_offsets.chunks_exact(2))
+        {
+            let count_offset = offsets[0];
+            let orientation_offset = offsets[1];
+            for local in 0..readback.key_count {
+                let count = read_u32(&orientation_data, count_offset + local * 4) as usize;
                 for slot in 0..count.min(MAX_ORIENTATIONS) {
-                    let offset = (local * MAX_ORIENTATIONS + slot) * 4;
-                    let mut feature = refined[index];
-                    feature.orientation = read_f32(&orientation_readback, offset);
+                    let offset = orientation_offset + (local * MAX_ORIENTATIONS + slot) * 4;
+                    let mut feature = refined[readback.indices[local]];
+                    feature.orientation = read_f32(&orientation_data, offset);
                     oriented.push(feature);
                 }
             }
@@ -835,6 +877,7 @@ impl Engine {
         detection: &Detection,
     ) -> Result<Vec<Option<D>>, RunError> {
         let mut descriptors: Vec<Option<D>> = (0..detection.features.len()).map(|_| None).collect();
+        let mut descriptor_readbacks = Vec::new();
         for (octave_index, octave) in detection.octaves.iter().enumerate() {
             let mut keys = Vec::new();
             let mut feature_indices = Vec::new();
@@ -865,8 +908,15 @@ impl Engine {
                 .ok_or(RunError::Capacity {
                     what: "descriptors",
                 })?;
+            let valid_bytes =
+                key_count
+                    .checked_mul(core::mem::size_of::<u32>())
+                    .ok_or(RunError::Capacity {
+                        what: "descriptor valid flags",
+                    })?;
             self.ensure_storage_capacity(key_bytes)?;
             self.ensure_storage_capacity(value_bytes)?;
+            self.ensure_storage_capacity(valid_bytes)?;
             let key_buffer =
                 storage_buffer(&self.device, "omvg-sift-descriptor-keys", key_bytes as u64);
             self.queue
@@ -875,7 +925,7 @@ impl Engine {
             let valid = storage_buffer(
                 &self.device,
                 "omvg-sift-descriptor-valid",
-                (key_count * core::mem::size_of::<u32>()) as u64,
+                valid_bytes as u64,
             );
             let uniform = uniform_buffer(
                 &self.device,
@@ -932,25 +982,40 @@ impl Engine {
                 pass.dispatch_workgroups(key_count as u32, 1, 1);
             }
             self.queue.submit(Some(encoder.finish()));
+            descriptor_readbacks.push(DescriptorReadback {
+                key_count,
+                valid_bytes,
+                value_bytes,
+                valid,
+                values,
+                feature_indices,
+            });
+        }
 
-            let valid_bytes_read = read_buffer(
-                &self.device,
-                &self.queue,
-                &valid,
-                key_count * core::mem::size_of::<u32>(),
-            )?;
-            let values_read = read_buffer(&self.device, &self.queue, &values, value_bytes)?;
-            for local in 0..key_count {
-                if read_u32(&valid_bytes_read, local * 4) == 0 {
+        let mut descriptor_ranges = Vec::with_capacity(descriptor_readbacks.len() * 2);
+        for readback in &descriptor_readbacks {
+            descriptor_ranges.push((&readback.valid, readback.valid_bytes));
+            descriptor_ranges.push((&readback.values, readback.value_bytes));
+        }
+        let (descriptor_data, descriptor_offsets) =
+            read_buffers(&self.device, &self.queue, &descriptor_ranges)?;
+        for (readback, offsets) in descriptor_readbacks
+            .iter()
+            .zip(descriptor_offsets.chunks_exact(2))
+        {
+            let valid_offset = offsets[0];
+            let values_offset = offsets[1];
+            for local in 0..readback.key_count {
+                if read_u32(&descriptor_data, valid_offset + local * 4) == 0 {
                     continue;
                 }
-                let base = local * SIFT_DESCR_SIZE * 4;
+                let base = values_offset + local * SIFT_DESCR_SIZE * 4;
                 let mut values = [0.0f32; SIFT_DESCR_SIZE];
                 for (index, value) in values.iter_mut().enumerate() {
-                    *value = read_f32(&values_read, base + index * 4);
+                    *value = read_f32(&descriptor_data, base + index * 4);
                 }
                 if let Ok(descriptor) = D::try_from_finalized(&values) {
-                    descriptors[feature_indices[local]] = Some(descriptor);
+                    descriptors[readback.feature_indices[local]] = Some(descriptor);
                 }
             }
         }
@@ -1638,25 +1703,41 @@ fn uniform_buffer<T: bytemuck::Pod>(
     buffer
 }
 
-fn read_buffer(
+fn read_buffers(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    buffer: &wgpu::Buffer,
-    bytes: usize,
-) -> Result<Vec<u8>, RunError> {
-    if bytes == 0 {
-        return Ok(Vec::new());
+    ranges: &[(&wgpu::Buffer, usize)],
+) -> Result<(Vec<u8>, Vec<usize>), RunError> {
+    let mut offsets = Vec::with_capacity(ranges.len());
+    let mut total = 0usize;
+    for &(_, bytes) in ranges {
+        let aligned = bytes
+            .div_ceil(4)
+            .checked_mul(4)
+            .ok_or(RunError::Capacity { what: "readback" })?;
+        offsets.push(total);
+        total = total
+            .checked_add(aligned)
+            .ok_or(RunError::Capacity { what: "readback" })?;
+    }
+    if total == 0 {
+        return Ok((Vec::new(), offsets));
     }
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("omvg-sift-staging"),
-        size: bytes.div_ceil(4) as u64 * 4,
+        size: total as u64,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("omvg-sift-staging"),
     });
-    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes.div_ceil(4) as u64 * 4);
+    for ((buffer, bytes), offset) in ranges.iter().zip(offsets.iter()) {
+        let size = (*bytes).div_ceil(4) as u64 * 4;
+        if size > 0 {
+            encoder.copy_buffer_to_buffer(buffer, 0, &staging, *offset as u64, size);
+        }
+    }
     queue.submit(Some(encoder.finish()));
     let slice = staging.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -1675,7 +1756,7 @@ fn read_buffer(
         .map_err(|error| RunError::Readback(error.to_string()))?
         .to_vec();
     staging.unmap();
-    Ok(data)
+    Ok((data, offsets))
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
