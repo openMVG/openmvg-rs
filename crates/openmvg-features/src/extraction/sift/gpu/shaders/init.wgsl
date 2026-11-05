@@ -20,8 +20,8 @@ struct InitParams {
 
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let col = gid.x;
-    let row = gid.y;
+    let row = gid.x;
+    let col = gid.y;
     if (col >= p.dst_rows_cols.y || row >= p.dst_rows_cols.x) {
         return;
     }

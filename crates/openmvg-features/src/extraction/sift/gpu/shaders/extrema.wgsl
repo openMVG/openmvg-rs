@@ -30,8 +30,8 @@ struct Candidate {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let col = gid.x;
-    let row = gid.y;
+    let row = gid.x;
+    let col = gid.y;
     let level = gid.z + 1u;
     if (col == 0u || col + 1u >= p.rows_cols.y
         || row == 0u || row + 1u >= p.rows_cols.x

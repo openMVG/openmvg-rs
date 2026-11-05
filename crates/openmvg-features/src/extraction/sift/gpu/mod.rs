@@ -1010,8 +1010,8 @@ impl Engine {
         pass.set_pipeline(&self.pipelines.init);
         pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
         pass.dispatch_workgroups(
-            (destination_cols as u32).div_ceil(16),
             (destination_rows as u32).div_ceil(16),
+            (destination_cols as u32).div_ceil(16),
             1,
         );
     }
@@ -1142,7 +1142,7 @@ impl Engine {
         });
         pass.set_pipeline(&self.pipelines.blur);
         pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
-        pass.dispatch_workgroups((cols as u32).div_ceil(16), (rows as u32).div_ceil(16), 1);
+        pass.dispatch_workgroups((rows as u32).div_ceil(16), (cols as u32).div_ceil(16), 1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1199,8 +1199,8 @@ impl Engine {
         pass.set_pipeline(&self.pipelines.decimate);
         pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
         pass.dispatch_workgroups(
-            (destination_cols as u32).div_ceil(16),
             (destination_rows as u32).div_ceil(16),
+            (destination_cols as u32).div_ceil(16),
             1,
         );
     }
@@ -1257,7 +1257,7 @@ impl Engine {
         });
         pass.set_pipeline(&self.pipelines.dog);
         pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
-        pass.dispatch_workgroups((cols as u32).div_ceil(16), (rows as u32).div_ceil(16), 1);
+        pass.dispatch_workgroups((rows as u32).div_ceil(16), (cols as u32).div_ceil(16), 1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1321,8 +1321,8 @@ impl Engine {
         pass.set_pipeline(&self.pipelines.extrema);
         pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
         pass.dispatch_workgroups(
-            (cols as u32).div_ceil(8),
             (rows as u32).div_ceil(8),
+            (cols as u32).div_ceil(8),
             levels.saturating_sub(3).max(1) as u32,
         );
     }

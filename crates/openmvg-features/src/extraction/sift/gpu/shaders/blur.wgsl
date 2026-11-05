@@ -29,8 +29,8 @@ fn sample_at(col: i32, row: i32) -> f32 {
 
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let col = gid.x;
-    let row = gid.y;
+    let row = gid.x;
+    let col = gid.y;
     if (col >= p.rows_cols.y || row >= p.rows_cols.x) {
         return;
     }
