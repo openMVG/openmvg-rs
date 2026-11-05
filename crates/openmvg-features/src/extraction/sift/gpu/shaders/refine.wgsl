@@ -16,7 +16,7 @@ struct RefineParams {
     peak_threshold: f32,
     cap: u32,
     octave: u32,
-    _pad0: u32,
+    grid_workgroups: u32,
     _pad1: vec4<u32>,
 };
 
@@ -118,15 +118,10 @@ fn taylor(level: i32, col: i32, row: i32) -> Taylor {
     return Taylor(dx, dy, ds, val, 1u);
 }
 
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let id = gid.x;
-    // `count[0]` can exceed the allocation when extrema overflows. Clamp the
-    // shader bound so an overflow is reported by the host instead of reading
-    // past the candidate buffer.
-    if (id >= min(count[0], p.cap)) {
-        return;
-    }
+fn refine_candidate(id: u32) {
+    // `count[0]` can exceed the allocation when extrema overflows. The caller
+    // clamps the loop bound so an overflow is reported by the host instead of
+    // reading past the candidate buffer.
     let candidate = candidates[id];
     let w = i32(p.rows_cols.y);
     let h = i32(p.rows_cols.x);
@@ -215,5 +210,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             candidate.level, candidate.i, candidate.j,
             select(0u, 1u, accepted), 0u,
         );
+    }
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // The candidate count is only known on the GPU, so use a fixed-size grid
+    // and stride over the live candidates instead of dispatching capacity/64
+    // workgroups. The capacity clamp also keeps overflow reads in bounds.
+    let limit = min(count[0], p.cap);
+    let stride = 64u * p.grid_workgroups;
+    var id = gid.x;
+    loop {
+        if (id >= limit) {
+            break;
+        }
+        refine_candidate(id);
+        id += stride;
     }
 }

@@ -40,6 +40,7 @@ const MIN_CANDIDATES: usize = 256;
 const MAX_ORIENTATIONS: usize = 36;
 const CANDIDATE_BYTES: usize = 24;
 const REFINED_BYTES: usize = 56;
+const REFINE_WORKGROUPS: u32 = 256;
 
 // =============================================================================
 // Public API
@@ -1350,6 +1351,7 @@ impl Engine {
         keep_buffers: &mut Vec<wgpu::Buffer>,
         keep_bind_groups: &mut Vec<wgpu::BindGroup>,
     ) {
+        let refine_workgroups = REFINE_WORKGROUPS.min(capacity.div_ceil(64).max(1) as u32);
         let uniform = uniform_buffer(
             &self.device,
             &self.queue,
@@ -1365,7 +1367,7 @@ impl Engine {
                 peak_threshold,
                 cap: capacity as u32,
                 octave: octave as u32,
-                pad0: 0,
+                grid_workgroups: refine_workgroups,
                 pad1: [0; 4],
             },
         );
@@ -1407,7 +1409,7 @@ impl Engine {
         });
         pass.set_pipeline(&self.pipelines.refine);
         pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
-        pass.dispatch_workgroups(capacity.div_ceil(64).max(1) as u32, 1, 1);
+        pass.dispatch_workgroups(refine_workgroups, 1, 1);
     }
 }
 
@@ -1776,7 +1778,7 @@ struct RefineParams {
     peak_threshold: f32,
     cap: u32,
     octave: u32,
-    pad0: u32,
+    grid_workgroups: u32,
     pad1: [u32; 4],
 }
 
