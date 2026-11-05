@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // 4x4x8 SIFT descriptor, computed from central-difference gradients of one
-// Gaussian level. Each of the 128 threads owns one histogram bin and scans the
-// support region, so the reduction order is fixed and results are
-// deterministic. The final L2/RootSIFT normalization matches
+// Gaussian level. One workgroup owns one keypoint. Each of the 16 threads owns
+// one spatial cell and its 8 orientation bins, and scans only the samples that
+// can contribute to that cell, so every sample is evaluated at most four times
+// instead of once per histogram bin. Each cell histogram is accumulated in a
+// fixed row-major order, and the 128 bins are reduced only at the end, keeping
+// the result deterministic. The final L2/RootSIFT normalization matches
 // `normalize_and_finalize_descriptor`.
 
 const PI: f32 = 3.141592653589793;
@@ -12,6 +15,9 @@ const TWO_PI: f32 = 6.283185307179586;
 const DESCRIPTOR_SCALE: f32 = 6.0;
 const SQRT2: f32 = 1.4142135623730951;
 const BINS: u32 = 128u;
+const CELLS_PER_SIDE: u32 = 4u;
+const ORIENTATION_BINS: u32 = 8u;
+const THREADS_PER_KEYPOINT: u32 = 16u;
 
 struct DescParams {
     rows_cols: vec2<u32>,
@@ -77,7 +83,7 @@ fn gradient_at(col: i32, row: i32, level: u32) -> vec2<f32> {
     return vec2(gx, gy);
 }
 
-@compute @workgroup_size(128, 1, 1)
+@compute @workgroup_size(16, 1, 1)
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -87,9 +93,12 @@ fn main(
         return;
     }
     let tid = lid.x;
+    let cell_i = tid / CELLS_PER_SIDE;
+    let cell_j = tid % CELLS_PER_SIDE;
+    var hist_cell = array<f32, 8>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
     let key = keys[id];
     let sigma = key.sigma;
-    var acc = 0.0;
 
     if (sigma >= 1e-6) {
         let cos_t = cos(-key.orientation);
@@ -98,14 +107,47 @@ fn main(
         let r = (1.0 + 0.25) * sigma_scale;
         let rp = r * SQRT2;
         let inv_bin_scale = 4.0 / (2.0 * sigma_scale);
+        let bin_scale = 1.0 / inv_bin_scale;
         let half_bins = 1.5;
         let inv_sigma_sq = 1.0 / (2.0 * sigma_scale * sigma_scale);
         let angle_to_bin = 8.0 / TWO_PI;
 
-        let row_min = u32(max(key.y - rp, 0.0));
-        let row_max = min(u32(key.y + rp + 1.0), p.rows_cols.x);
-        let col_min = u32(max(key.x - rp, 0.0));
-        let col_max = min(u32(key.x + rp + 1.0), p.rows_cols.y);
+        // A sample contributes to spatial bin i when floor(alpha) is i
+        // (weight 1 - frac) or i - 1 (weight frac). Thus cell (i, j) only
+        // needs alpha in [i - 1, i + 1] and beta in [j - 1, j + 1]. Transform
+        // that rotated rectangle back to image coordinates and scan its
+        // axis-aligned bounding box.
+        let alpha_min = f32(cell_i) - 1.0;
+        let alpha_max = f32(cell_i) + 1.0;
+        let beta_min = f32(cell_j) - 1.0;
+        let beta_max = f32(cell_j) + 1.0;
+        let rot_tol = bin_scale * 1.0e-4;
+        let xr_min = (alpha_min - half_bins) * bin_scale - rot_tol;
+        let xr_max = (alpha_max - half_bins) * bin_scale + rot_tol;
+        let yr_min = (beta_min - half_bins) * bin_scale - rot_tol;
+        let yr_max = (beta_max - half_bins) * bin_scale + rot_tol;
+
+        let x0 = key.x + cos_t * xr_min + sin_t * yr_min;
+        let y0 = key.y - sin_t * xr_min + cos_t * yr_min;
+        let x1 = key.x + cos_t * xr_min + sin_t * yr_max;
+        let y1 = key.y - sin_t * xr_min + cos_t * yr_max;
+        let x2 = key.x + cos_t * xr_max + sin_t * yr_min;
+        let y2 = key.y - sin_t * xr_max + cos_t * yr_min;
+        let x3 = key.x + cos_t * xr_max + sin_t * yr_max;
+        let y3 = key.y - sin_t * xr_max + cos_t * yr_max;
+
+        let pixel_tol = 1.0e-3;
+        let min_x = min(min(x0, x1), min(x2, x3)) - pixel_tol;
+        let max_x = max(max(x0, x1), max(x2, x3)) + pixel_tol;
+        let min_y = min(min(y0, y1), min(y2, y3)) - pixel_tol;
+        let max_y = max(max(y0, y1), max(y2, y3)) + pixel_tol;
+
+        let rows = f32(p.rows_cols.x);
+        let cols = f32(p.rows_cols.y);
+        let row_min = u32(clamp(floor(min_y), 0.0, rows));
+        let row_max = u32(clamp(ceil(max_y), 0.0, rows));
+        let col_min = u32(clamp(floor(min_x), 0.0, cols));
+        let col_max = u32(clamp(ceil(max_x), 0.0, cols));
 
         for (var row = row_min; row < row_max; row += 1u) {
             let y_ref = f32(row) - key.y;
@@ -153,61 +195,35 @@ fn main(
                 let beta_frac = beta - beta_floor;
                 let gamma_frac = gamma - gamma_floor;
 
-                let i0v = i0 >= 0 && i0 < 4;
-                let i1v = i0 + 1 >= 0 && i0 + 1 < 4;
-                let j0v = j0 >= 0 && j0 < 4;
-                let j1v = j0 + 1 >= 0 && j0 + 1 < 4;
-                let k_left = u32(gamma_floor) % 8u;
-                let k_right = (k_left + 1u) % 8u;
-                let alpha_inv = 1.0 - alpha_frac;
-                let beta_inv = 1.0 - beta_frac;
-                let gamma_inv = 1.0 - gamma_frac;
+                let i0_match = i0 == i32(cell_i);
+                let i1_match = i0 + 1 == i32(cell_i);
+                let j0_match = j0 == i32(cell_j);
+                let j1_match = j0 + 1 == i32(cell_j);
+                if (!(i0_match || i1_match) || !(j0_match || j1_match)) {
+                    continue;
+                }
 
-                if (i0v && j0v) {
-                    let base = u32(i0) * 32u + u32(j0) * 8u;
-                    let spatial = alpha_inv * beta_inv * m;
-                    if (base + k_left == tid) {
-                        acc += gamma_inv * spatial;
-                    }
-                    if (base + k_right == tid) {
-                        acc += gamma_frac * spatial;
-                    }
+                let wi = select(0.0, 1.0 - alpha_frac, i0_match)
+                    + select(0.0, alpha_frac, i1_match);
+                let wj = select(0.0, 1.0 - beta_frac, j0_match)
+                    + select(0.0, beta_frac, j1_match);
+                let spatial = wi * wj * m;
+                if (spatial == 0.0) {
+                    continue;
                 }
-                if (i0v && j1v) {
-                    let base = u32(i0) * 32u + u32(j0 + 1) * 8u;
-                    let spatial = alpha_inv * beta_frac * m;
-                    if (base + k_left == tid) {
-                        acc += gamma_inv * spatial;
-                    }
-                    if (base + k_right == tid) {
-                        acc += gamma_frac * spatial;
-                    }
-                }
-                if (i1v && j0v) {
-                    let base = u32(i0 + 1) * 32u + u32(j0) * 8u;
-                    let spatial = alpha_frac * beta_inv * m;
-                    if (base + k_left == tid) {
-                        acc += gamma_inv * spatial;
-                    }
-                    if (base + k_right == tid) {
-                        acc += gamma_frac * spatial;
-                    }
-                }
-                if (i1v && j1v) {
-                    let base = u32(i0 + 1) * 32u + u32(j0 + 1) * 8u;
-                    let spatial = alpha_frac * beta_frac * m;
-                    if (base + k_left == tid) {
-                        acc += gamma_inv * spatial;
-                    }
-                    if (base + k_right == tid) {
-                        acc += gamma_frac * spatial;
-                    }
-                }
+
+                let k_left = u32(gamma_floor) % ORIENTATION_BINS;
+                let k_right = (k_left + 1u) % ORIENTATION_BINS;
+                let gamma_inv = 1.0 - gamma_frac;
+                hist_cell[k_left] += gamma_inv * spatial;
+                hist_cell[k_right] += gamma_frac * spatial;
             }
         }
     }
 
-    hist[tid] = acc;
+    for (var k = 0u; k < ORIENTATION_BINS; k += 1u) {
+        hist[cell_i * 32u + cell_j * 8u + k] = hist_cell[k];
+    }
     workgroupBarrier();
 
     if (tid == 0u) {
