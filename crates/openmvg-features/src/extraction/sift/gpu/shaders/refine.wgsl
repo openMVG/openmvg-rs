@@ -121,7 +121,10 @@ fn taylor(level: i32, col: i32, row: i32) -> Taylor {
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let id = gid.x;
-    if (id >= count[0]) {
+    // `count[0]` can exceed the allocation when extrema overflows. Clamp the
+    // shader bound so an overflow is reported by the host instead of reading
+    // past the candidate buffer.
+    if (id >= min(count[0], p.cap)) {
         return;
     }
     let candidate = candidates[id];
