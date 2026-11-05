@@ -519,7 +519,6 @@ impl Engine {
                 &mut encoder,
                 &temp_as[0],
                 &temp_bs[0],
-                &temp_as[0],
                 &octaves[0].gauss,
                 0,
                 base_rows,
@@ -575,7 +574,6 @@ impl Engine {
                     &mut encoder,
                     &octaves[octave].gauss,
                     &temp_as[octave],
-                    &temp_bs[octave],
                     &octaves[octave].gauss,
                     (level - 1) * plane,
                     rows,
@@ -1086,7 +1084,6 @@ impl Engine {
         encoder: &mut wgpu::CommandEncoder,
         source: &wgpu::Buffer,
         temp_a: &wgpu::Buffer,
-        temp_b: &wgpu::Buffer,
         destination: &wgpu::Buffer,
         source_offset: usize,
         rows: usize,
@@ -1123,26 +1120,23 @@ impl Engine {
             keep_buffers,
             keep_bind_groups,
         );
+        // The first pass reads `source`; the second writes `destination`
+        // directly. The destination may be the same buffer as `source` at a
+        // different plane offset, but the dispatches are ordered and the
+        // intermediate lives in `temp_a`.
         self.encode_blur(
             encoder,
             temp_a,
-            temp_b,
+            destination,
             &weight_buffer,
             rows,
             cols,
             0,
-            0,
+            destination_offset,
             radius,
             false,
             keep_buffers,
             keep_bind_groups,
-        );
-        encoder.copy_buffer_to_buffer(
-            temp_b,
-            0,
-            destination,
-            (destination_offset * core::mem::size_of::<f32>()) as u64,
-            (rows * cols * core::mem::size_of::<f32>()) as u64,
         );
     }
 
