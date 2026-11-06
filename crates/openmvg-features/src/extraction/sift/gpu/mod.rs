@@ -255,15 +255,33 @@ struct Octave {
 struct Detection {
     features: Vec<Feature>,
     octaves: Vec<Octave>,
+    compact_keys: Option<CompactKeys>,
+}
+
+struct CompactKeys {
+    totals: Vec<usize>,
+    feature_starts: Vec<usize>,
+    keys: Vec<Option<wgpu::Buffer>>,
 }
 
 struct OrientationReadback {
+    octave: usize,
     key_count: usize,
     count_bytes: usize,
-    orientation_bytes: usize,
+    keys: wgpu::Buffer,
     counts: wgpu::Buffer,
     orientations: wgpu::Buffer,
     indices: Vec<usize>,
+}
+
+struct OrientationCompaction {
+    total: usize,
+    counts: Vec<u32>,
+    offsets: Vec<u32>,
+    offset_buffer: wgpu::Buffer,
+    compact_orientation_bytes: usize,
+    compact_orientations: wgpu::Buffer,
+    compact_keys: wgpu::Buffer,
 }
 
 struct DescriptorReadback {
@@ -388,6 +406,8 @@ struct Scratch {
     orientation_keys: Vec<GrowBuffer>,
     orientation_counts: Vec<GrowBuffer>,
     orientations: Vec<GrowBuffer>,
+    orientation_offsets: Vec<GrowBuffer>,
+    compact_orientations: Vec<GrowBuffer>,
     descriptor_keys: Vec<GrowBuffer>,
     descriptors: Vec<GrowBuffer>,
     descriptor_valid: Vec<GrowBuffer>,
@@ -406,6 +426,10 @@ impl Scratch {
             self.orientation_counts
                 .resize_with(stages, GrowBuffer::default);
             self.orientations.resize_with(stages, GrowBuffer::default);
+            self.orientation_offsets
+                .resize_with(stages, GrowBuffer::default);
+            self.compact_orientations
+                .resize_with(stages, GrowBuffer::default);
             self.descriptor_keys
                 .resize_with(stages, GrowBuffer::default);
             self.descriptors.resize_with(stages, GrowBuffer::default);
@@ -459,6 +483,16 @@ impl Scratch {
                 .map(|buffer| buffer.allocations)
                 .sum::<usize>()
             + self
+                .orientation_offsets
+                .iter()
+                .map(|buffer| buffer.allocations)
+                .sum::<usize>()
+            + self
+                .compact_orientations
+                .iter()
+                .map(|buffer| buffer.allocations)
+                .sum::<usize>()
+            + self
                 .descriptor_keys
                 .iter()
                 .map(|buffer| buffer.allocations)
@@ -508,6 +542,7 @@ struct Layouts {
     extrema: wgpu::BindGroupLayout,
     refine: wgpu::BindGroupLayout,
     orientation: wgpu::BindGroupLayout,
+    compact: wgpu::BindGroupLayout,
     describe: wgpu::BindGroupLayout,
 }
 
@@ -519,6 +554,7 @@ struct Pipelines {
     extrema: wgpu::ComputePipeline,
     refine: wgpu::ComputePipeline,
     orientation: wgpu::ComputePipeline,
+    compact: wgpu::ComputePipeline,
     describe: wgpu::ComputePipeline,
 }
 
@@ -575,7 +611,7 @@ impl Engine {
         image: &GrayImage,
     ) -> Result<Vec<ScaleSpaceKeypoint>, RunError> {
         let mut scratch = self.lock_scratch()?;
-        let detection = self.detect_features(config, image, &mut scratch)?;
+        let detection = self.detect_features(config, image, &mut scratch, false)?;
         Ok(detection
             .features
             .into_iter()
@@ -589,7 +625,7 @@ impl Engine {
         image: &GrayImage,
     ) -> Result<ScaleSpaceFeatures<D>, RunError> {
         let mut scratch = self.lock_scratch()?;
-        let detection = self.detect_features(config, image, &mut scratch)?;
+        let detection = self.detect_features(config, image, &mut scratch, true)?;
         let descriptors = self.describe::<D>(config, &detection, &mut scratch)?;
         Ok(assemble_features(detection, descriptors))
     }
@@ -600,7 +636,7 @@ impl Engine {
         image: &GrayImage,
     ) -> Result<ScaleSpaceFeatures<U8Descriptor>, RunError> {
         let mut scratch = self.lock_scratch()?;
-        let detection = self.detect_features(config, image, &mut scratch)?;
+        let detection = self.detect_features(config, image, &mut scratch, true)?;
         let descriptors = self.describe_u8(config, &detection, &mut scratch)?;
         Ok(assemble_features(detection, descriptors))
     }
@@ -610,6 +646,7 @@ impl Engine {
         config: &SiftExtractor,
         image: &GrayImage,
         scratch: &mut Scratch,
+        for_descriptors: bool,
     ) -> Result<Detection, RunError> {
         let height = image.nrows();
         let width = image.ncols();
@@ -617,6 +654,7 @@ impl Engine {
             return Ok(Detection {
                 features: Vec::new(),
                 octaves: Vec::new(),
+                compact_keys: None,
             });
         }
 
@@ -1112,47 +1150,233 @@ impl Engine {
             }
             self.queue.submit(Some(encoder.finish()));
             orientation_readbacks.push(OrientationReadback {
+                octave,
                 key_count,
                 count_bytes,
-                orientation_bytes,
+                keys: key_buffer,
                 counts,
                 orientations,
                 indices,
             });
         }
 
-        let mut orientation_ranges = Vec::with_capacity(orientation_readbacks.len() * 2);
+        // Read only the per-keypoint orientation counts first. The fixed-stride
+        // orientation planes stay on the GPU; a compaction pass copies the used
+        // peaks into dense buffers in detector order.
+        let mut count_ranges = Vec::with_capacity(orientation_readbacks.len());
         for readback in &orientation_readbacks {
-            orientation_ranges.push((&readback.counts, readback.count_bytes));
-            orientation_ranges.push((&readback.orientations, readback.orientation_bytes));
+            count_ranges.push((&readback.counts, readback.count_bytes));
+        }
+        let (count_data, count_offsets) = read_buffers(
+            &self.device,
+            &self.queue,
+            &mut scratch.staging,
+            &count_ranges,
+        )?;
+        let mut compactions = Vec::with_capacity(orientation_readbacks.len());
+        for (index, readback) in orientation_readbacks.iter().enumerate() {
+            let mut counts = Vec::with_capacity(readback.key_count);
+            let mut offsets = Vec::with_capacity(readback.key_count);
+            let mut total = 0usize;
+            for local in 0..readback.key_count {
+                let count = read_u32(&count_data, count_offsets[index] + local * 4) as usize;
+                let count = count.min(MAX_ORIENTATIONS);
+                counts.push(count as u32);
+                offsets.push(total as u32);
+                total = total.checked_add(count).ok_or(RunError::Capacity {
+                    what: "orientations",
+                })?;
+            }
+            let offset_bytes = readback
+                .key_count
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(RunError::Capacity {
+                    what: "orientation offsets",
+                })?;
+            let compact_orientation_bytes =
+                total
+                    .checked_mul(core::mem::size_of::<f32>())
+                    .ok_or(RunError::Capacity {
+                        what: "compact orientations",
+                    })?;
+            let compact_key_bytes = total
+                .checked_mul(core::mem::size_of::<GpuDescKey>())
+                .ok_or(RunError::Capacity {
+                    what: "compact descriptor keys",
+                })?;
+            self.ensure_storage_capacity(offset_bytes)?;
+            self.ensure_storage_capacity(compact_orientation_bytes)?;
+            self.ensure_storage_capacity(compact_key_bytes)?;
+            let offset_buffer = scratch.orientation_offsets[readback.octave].ensure_storage(
+                &self.device,
+                "omvg-sift-orientation-offsets",
+                offset_bytes,
+            );
+            self.queue
+                .write_buffer(&offset_buffer, 0, bytemuck::cast_slice(&offsets));
+            let compact_orientations = scratch.compact_orientations[readback.octave]
+                .ensure_storage(
+                    &self.device,
+                    "omvg-sift-compact-orientations",
+                    compact_orientation_bytes,
+                );
+            let compact_keys = scratch.descriptor_keys[readback.octave].ensure_storage(
+                &self.device,
+                "omvg-sift-compact-keys",
+                compact_key_bytes,
+            );
+            compactions.push(OrientationCompaction {
+                total,
+                counts,
+                offsets,
+                offset_buffer,
+                compact_orientation_bytes,
+                compact_orientations,
+                compact_keys,
+            });
+        }
+
+        if !compactions.is_empty() {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("omvg-sift-orientation-compact"),
+                });
+            let mut keep_buffers: Vec<wgpu::Buffer> = Vec::new();
+            let mut keep_bind_groups: Vec<wgpu::BindGroup> = Vec::new();
+            for (readback, compaction) in orientation_readbacks.iter().zip(&compactions) {
+                let uniform = uniform_buffer(
+                    &self.device,
+                    &self.queue,
+                    "omvg-sift-compact-params",
+                    &CompactParams {
+                        key_count: readback.key_count as u32,
+                        max_orientations: MAX_ORIENTATIONS as u32,
+                        pad0: 0,
+                        pad1: 0,
+                    },
+                );
+                keep_buffers.push(uniform.clone());
+                keep_bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("omvg-sift-compact"),
+                    layout: &self.layouts.compact,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: readback.counts.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: compaction.offset_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: readback.orientations.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: readback.keys.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: compaction.compact_orientations.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: compaction.compact_keys.as_entire_binding(),
+                        },
+                    ],
+                }));
+                let bind_group = keep_bind_groups.last().ok_or(RunError::Capacity {
+                    what: "compact bind group",
+                })?;
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("omvg-sift-compact"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipelines.compact);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(readback.key_count.div_ceil(64).max(1) as u32, 1, 1);
+            }
+            self.queue.submit(Some(encoder.finish()));
+            drop(keep_bind_groups);
+            drop(keep_buffers);
+        }
+
+        let mut compact_ranges = Vec::with_capacity(compactions.len());
+        for compaction in &compactions {
+            compact_ranges.push((
+                &compaction.compact_orientations,
+                compaction.compact_orientation_bytes,
+            ));
         }
         let (orientation_data, orientation_offsets) = read_buffers(
             &self.device,
             &self.queue,
             &mut scratch.staging,
-            &orientation_ranges,
+            &compact_ranges,
         )?;
         let mut oriented = Vec::new();
-        for (readback, offsets) in orientation_readbacks
+        for ((readback, compaction), offset) in orientation_readbacks
             .iter()
-            .zip(orientation_offsets.as_chunks::<2>().0)
+            .zip(&compactions)
+            .zip(orientation_offsets)
         {
-            let count_offset = offsets[0];
-            let orientation_offset = offsets[1];
             for local in 0..readback.key_count {
-                let count = read_u32(&orientation_data, count_offset + local * 4) as usize;
-                for slot in 0..count.min(MAX_ORIENTATIONS) {
-                    let offset = orientation_offset + (local * MAX_ORIENTATIONS + slot) * 4;
+                let count = compaction.counts[local] as usize;
+                let base = compaction.offsets[local] as usize;
+                for slot in 0..count {
                     let mut feature = refined[readback.indices[local]];
-                    feature.orientation = read_f32(&orientation_data, offset);
+                    feature.orientation = read_f32(&orientation_data, offset + (base + slot) * 4);
                     oriented.push(feature);
                 }
             }
         }
 
+        let oriented_total = oriented.len();
         let mut features = oriented;
         apply_feature_budget(&mut features, width, height, &config.feature_budget);
-        Ok(Detection { features, octaves })
+
+        let compact_keys =
+            if for_descriptors && !features.is_empty() && features.len() == oriented_total {
+                let mut totals = vec![0usize; octaves.len()];
+                let mut feature_starts = vec![0usize; octaves.len()];
+                let mut keys: Vec<Option<wgpu::Buffer>> =
+                    (0..octaves.len()).map(|_| None).collect();
+                let mut start = 0usize;
+                for (readback, compaction) in orientation_readbacks.iter().zip(&compactions) {
+                    totals[readback.octave] = compaction.total;
+                    feature_starts[readback.octave] = start;
+                    keys[readback.octave] = Some(compaction.compact_keys.clone());
+                    start = start
+                        .checked_add(compaction.total)
+                        .ok_or(RunError::Capacity {
+                            what: "compact descriptor keys",
+                        })?;
+                }
+                if start != oriented_total {
+                    return Err(RunError::Capacity {
+                        what: "compact descriptor keys",
+                    });
+                }
+                Some(CompactKeys {
+                    totals,
+                    feature_starts,
+                    keys,
+                })
+            } else {
+                None
+            };
+
+        Ok(Detection {
+            features,
+            octaves,
+            compact_keys,
+        })
     }
 
     fn describe<D: DescriptorStorage>(
@@ -1198,29 +1422,63 @@ impl Engine {
     ) -> Result<Vec<DescriptorReadback>, RunError> {
         let mut descriptor_readbacks = Vec::new();
         for (octave_index, octave) in detection.octaves.iter().enumerate() {
-            let mut keys = Vec::new();
-            let mut feature_indices = Vec::new();
-            for (index, feature) in detection.features.iter().enumerate() {
-                if feature.octave == octave_index {
-                    keys.push(GpuDescKey {
-                        x: feature.x / octave.delta,
-                        y: feature.y / octave.delta,
-                        sigma: feature.sigma / octave.delta,
-                        orientation: feature.orientation,
-                        level: feature.scale_index as u32,
-                    });
-                    feature_indices.push(index);
-                }
+            let compact_key = detection.compact_keys.as_ref().and_then(|compact| {
+                compact.keys[octave_index]
+                    .as_ref()
+                    .map(|buffer| (compact, buffer.clone()))
+            });
+            let (key_count, key_buffer, feature_indices, host_keys) =
+                if let Some((compact, key_buffer)) = compact_key {
+                    let key_count = compact.totals[octave_index];
+                    if key_count == 0 {
+                        continue;
+                    }
+                    let start = compact.feature_starts[octave_index];
+                    let end = start.checked_add(key_count).ok_or(RunError::Capacity {
+                        what: "compact descriptor keys",
+                    })?;
+                    if end > detection.features.len() {
+                        return Err(RunError::Capacity {
+                            what: "compact descriptor keys",
+                        });
+                    }
+                    (key_count, key_buffer, (start..end).collect(), None)
+                } else {
+                    let mut keys = Vec::new();
+                    let mut feature_indices = Vec::new();
+                    for (index, feature) in detection.features.iter().enumerate() {
+                        if feature.octave == octave_index {
+                            keys.push(GpuDescKey {
+                                x: feature.x / octave.delta,
+                                y: feature.y / octave.delta,
+                                sigma: feature.sigma / octave.delta,
+                                orientation: feature.orientation,
+                                level: feature.scale_index as u32,
+                            });
+                            feature_indices.push(index);
+                        }
+                    }
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let key_count = keys.len();
+                    let key_bytes = key_count
+                        .checked_mul(core::mem::size_of::<GpuDescKey>())
+                        .ok_or(RunError::Capacity {
+                            what: "descriptor keys",
+                        })?;
+                    self.ensure_storage_capacity(key_bytes)?;
+                    let key_buffer = scratch.descriptor_keys[octave_index].ensure_storage(
+                        &self.device,
+                        "omvg-sift-descriptor-keys",
+                        key_bytes,
+                    );
+                    (key_count, key_buffer, feature_indices, Some(keys))
+                };
+            if let Some(keys) = host_keys {
+                self.queue
+                    .write_buffer(&key_buffer, 0, bytemuck::cast_slice(&keys));
             }
-            if keys.is_empty() {
-                continue;
-            }
-            let key_count = keys.len();
-            let key_bytes = key_count
-                .checked_mul(core::mem::size_of::<GpuDescKey>())
-                .ok_or(RunError::Capacity {
-                    what: "descriptor keys",
-                })?;
             let value_bytes = format.value_bytes(key_count).ok_or(RunError::Capacity {
                 what: "descriptors",
             })?;
@@ -1230,16 +1488,8 @@ impl Engine {
                     .ok_or(RunError::Capacity {
                         what: "descriptor valid flags",
                     })?;
-            self.ensure_storage_capacity(key_bytes)?;
             self.ensure_storage_capacity(value_bytes)?;
             self.ensure_storage_capacity(valid_bytes)?;
-            let key_buffer = scratch.descriptor_keys[octave_index].ensure_storage(
-                &self.device,
-                "omvg-sift-descriptor-keys",
-                key_bytes,
-            );
-            self.queue
-                .write_buffer(&key_buffer, 0, bytemuck::cast_slice(&keys));
             let values = scratch.descriptors[octave_index].ensure_storage(
                 &self.device,
                 "omvg-sift-descriptors",
@@ -1836,6 +2086,19 @@ impl Layouts {
                     storage(4, false),
                 ],
             ),
+            compact: layout(
+                device,
+                "omvg-sift-compact",
+                &[
+                    uniform(0),
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, true),
+                    storage(4, true),
+                    storage(5, false),
+                    storage(6, false),
+                ],
+            ),
             describe: layout(
                 device,
                 "omvg-sift-descriptor",
@@ -1895,6 +2158,12 @@ impl Pipelines {
                 "omvg-sift-orientation",
                 layouts.orientation.clone(),
                 include_str!("shaders/orientation.wgsl"),
+            ),
+            compact: pipeline(
+                device,
+                "omvg-sift-compact",
+                layouts.compact.clone(),
+                include_str!("shaders/compact.wgsl"),
             ),
             describe: pipeline(
                 device,
@@ -2279,6 +2548,15 @@ struct DescParams {
     out_off: u32,
     gauss_off: u32,
     quantize_u8: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CompactParams {
+    key_count: u32,
+    max_orientations: u32,
+    pad0: u32,
+    pad1: u32,
 }
 
 #[repr(C)]
