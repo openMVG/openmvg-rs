@@ -8,13 +8,16 @@
 // instead of once per histogram bin. Each cell histogram is accumulated in a
 // fixed row-major order, and the 128 bins are reduced only at the end, keeping
 // the result deterministic. The final L2/RootSIFT normalization matches
-// `normalize_and_finalize_descriptor`.
+// `normalize_and_finalize_descriptor`. With `quantize_u8 == 1`, the finalized
+// values are rounded to the shared u8 grid and packed four per u32 so the host
+// reads 128 bytes per descriptor instead of 512.
 
 const PI: f32 = 3.141592653589793;
 const TWO_PI: f32 = 6.283185307179586;
 const DESCRIPTOR_SCALE: f32 = 6.0;
 const SQRT2: f32 = 1.4142135623730951;
 const BINS: u32 = 128u;
+const PACKED_BINS: u32 = 32u;
 const CELLS_PER_SIDE: u32 = 4u;
 const ORIENTATION_BINS: u32 = 8u;
 const THREADS_PER_KEYPOINT: u32 = 16u;
@@ -26,7 +29,7 @@ struct DescParams {
     key_count: u32,
     out_off: u32,
     gauss_off: u32,
-    _pad: u32,
+    quantize_u8: u32,
 };
 
 struct DescKey {
@@ -40,10 +43,18 @@ struct DescKey {
 @group(0) @binding(0) var<uniform> p: DescParams;
 @group(0) @binding(1) var<storage, read> gauss: array<f32>;
 @group(0) @binding(2) var<storage, read> keys: array<DescKey>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<u32>;
 @group(0) @binding(4) var<storage, read_write> valid: array<u32>;
 
 var<workgroup> hist: array<f32, 128>;
+
+fn quantize_byte(value: f32) -> u32 {
+    if (!(value > -3.0e38) || !(value < 3.0e38)) {
+        return 0u;
+    }
+    let clamped = clamp(value, 0.0, 255.0);
+    return u32(floor(clamped + 0.5));
+}
 
 fn fast_atan2(y: f32, x: f32) -> f32 {
     let ax = abs(x);
@@ -232,17 +243,19 @@ fn main(
             norm_sq += hist[i] * hist[i];
         }
         let norm = sqrt(norm_sq);
-        let out_base = p.out_off + id * BINS;
+        let out_words = select(BINS, PACKED_BINS, p.quantize_u8 == 1u);
+        let out_base = p.out_off + id * out_words;
         if (!(norm > 1e-7) || !(norm < 3.0e38)) {
             valid[id] = 0u;
-            for (var i = 0u; i < BINS; i += 1u) {
-                out[out_base + i] = 0.0;
+            for (var i = 0u; i < out_words; i += 1u) {
+                out[out_base + i] = 0u;
             }
             return;
         }
 
         let inv_norm = 1.0 / norm;
         var norm2_sq = 0.0;
+        var all_finite = true;
         if (p.root_sift == 1u) {
             var l1 = 0.0;
             for (var i = 0u; i < BINS; i += 1u) {
@@ -254,9 +267,29 @@ fn main(
                 norm2_sq += v * v;
             }
             let scale = 512.0 / max(sqrt(norm2_sq), 1e-7);
-            for (var i = 0u; i < BINS; i += 1u) {
-                let v = sqrt(max(hist[i] * inv_norm / l1, 0.0));
-                out[out_base + i] = min(v * scale, 255.0);
+            if (p.quantize_u8 == 1u) {
+                for (var chunk = 0u; chunk < PACKED_BINS; chunk += 1u) {
+                    var packed = 0u;
+                    for (var lane = 0u; lane < 4u; lane += 1u) {
+                        let i = chunk * 4u + lane;
+                        let v = sqrt(max(hist[i] * inv_norm / l1, 0.0));
+                        let value = min(v * scale, 255.0);
+                        if (!(value > -3.0e38) || !(value < 3.0e38)) {
+                            all_finite = false;
+                        }
+                        packed = packed | (quantize_byte(value) << (lane * 8u));
+                    }
+                    out[out_base + chunk] = packed;
+                }
+            } else {
+                for (var i = 0u; i < BINS; i += 1u) {
+                    let v = sqrt(max(hist[i] * inv_norm / l1, 0.0));
+                    let value = min(v * scale, 255.0);
+                    if (!(value > -3.0e38) || !(value < 3.0e38)) {
+                        all_finite = false;
+                    }
+                    out[out_base + i] = bitcast<u32>(value);
+                }
             }
         } else {
             for (var i = 0u; i < BINS; i += 1u) {
@@ -264,11 +297,31 @@ fn main(
                 norm2_sq += v * v;
             }
             let scale = 512.0 / max(sqrt(norm2_sq), 1e-7);
-            for (var i = 0u; i < BINS; i += 1u) {
-                let v = min(hist[i] * inv_norm, 0.2);
-                out[out_base + i] = min(v * scale, 255.0);
+            if (p.quantize_u8 == 1u) {
+                for (var chunk = 0u; chunk < PACKED_BINS; chunk += 1u) {
+                    var packed = 0u;
+                    for (var lane = 0u; lane < 4u; lane += 1u) {
+                        let i = chunk * 4u + lane;
+                        let v = min(hist[i] * inv_norm, 0.2);
+                        let value = min(v * scale, 255.0);
+                        if (!(value > -3.0e38) || !(value < 3.0e38)) {
+                            all_finite = false;
+                        }
+                        packed = packed | (quantize_byte(value) << (lane * 8u));
+                    }
+                    out[out_base + chunk] = packed;
+                }
+            } else {
+                for (var i = 0u; i < BINS; i += 1u) {
+                    let v = min(hist[i] * inv_norm, 0.2);
+                    let value = min(v * scale, 255.0);
+                    if (!(value > -3.0e38) || !(value < 3.0e38)) {
+                        all_finite = false;
+                    }
+                    out[out_base + i] = bitcast<u32>(value);
+                }
             }
         }
-        valid[id] = 1u;
+        valid[id] = select(0u, 1u, all_finite);
     }
 }

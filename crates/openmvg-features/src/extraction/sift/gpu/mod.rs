@@ -19,6 +19,8 @@
 //! One extractor is meant to be reused for a batch of images. Its scratch
 //! buffers stay resident and grow only when a later image needs more space,
 //! so repeated and alternating image sizes avoid per-image GPU allocation.
+//! The u8 path quantizes on the device and reads back packed bytes, so it
+//! transfers four times fewer descriptor bytes than the f32 path.
 //!
 //! [`GrayImage`]: crate::extraction::GrayImage
 
@@ -46,6 +48,7 @@ const MAX_ORIENTATIONS: usize = 36;
 const CANDIDATE_BYTES: usize = 24;
 const REFINED_BYTES: usize = 56;
 const REFINE_WORKGROUPS: u32 = 256;
+const PACKED_DESCR_WORDS: usize = SIFT_DESCR_SIZE / 4;
 
 // =============================================================================
 // Public API
@@ -177,6 +180,8 @@ impl SiftGpuExtractor {
 
     /// Detect and describe with u8 descriptors.
     ///
+    /// Quantization runs on the GPU and only the packed bytes are read back.
+    ///
     /// # Errors
     ///
     /// Returns an error if the GPU device or a result buffer fails.
@@ -184,7 +189,9 @@ impl SiftGpuExtractor {
         &self,
         image: &GrayImage,
     ) -> Result<ScaleSpaceFeatures<U8Descriptor>, SiftGpuError> {
-        self.extract_typed(image)
+        self.engine
+            .extract_u8(&self.config, image)
+            .map_err(Into::into)
     }
 
     /// Detect and describe with the descriptor storage `D`.
@@ -266,6 +273,34 @@ struct DescriptorReadback {
     valid: wgpu::Buffer,
     values: wgpu::Buffer,
     feature_indices: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum DescriptorFormat {
+    F32,
+    U8,
+}
+
+impl DescriptorFormat {
+    fn quantize_u8(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::U8 => 1,
+        }
+    }
+
+    fn words_per_key(self) -> usize {
+        match self {
+            Self::F32 => SIFT_DESCR_SIZE,
+            Self::U8 => PACKED_DESCR_WORDS,
+        }
+    }
+
+    fn value_bytes(self, key_count: usize) -> Option<usize> {
+        key_count
+            .checked_mul(self.words_per_key())
+            .and_then(|words| words.checked_mul(core::mem::size_of::<u32>()))
+    }
 }
 
 // =============================================================================
@@ -556,16 +591,18 @@ impl Engine {
         let mut scratch = self.lock_scratch()?;
         let detection = self.detect_features(config, image, &mut scratch)?;
         let descriptors = self.describe::<D>(config, &detection, &mut scratch)?;
-        let mut features = ScaleSpaceFeatures::default();
-        features.keypoints.reserve(detection.features.len());
-        features.descriptors.reserve(detection.features.len());
-        for (feature, descriptor) in detection.features.into_iter().zip(descriptors) {
-            if let Some(descriptor) = descriptor {
-                features.keypoints.push(feature.geometry());
-                features.descriptors.push(descriptor);
-            }
-        }
-        Ok(features)
+        Ok(assemble_features(detection, descriptors))
+    }
+
+    fn extract_u8(
+        &self,
+        config: &SiftExtractor,
+        image: &GrayImage,
+    ) -> Result<ScaleSpaceFeatures<U8Descriptor>, RunError> {
+        let mut scratch = self.lock_scratch()?;
+        let detection = self.detect_features(config, image, &mut scratch)?;
+        let descriptors = self.describe_u8(config, &detection, &mut scratch)?;
+        Ok(assemble_features(detection, descriptors))
     }
 
     fn detect_features(
@@ -1124,7 +1161,41 @@ impl Engine {
         detection: &Detection,
         scratch: &mut Scratch,
     ) -> Result<Vec<Option<D>>, RunError> {
-        let mut descriptors: Vec<Option<D>> = (0..detection.features.len()).map(|_| None).collect();
+        let readbacks =
+            self.encode_descriptor_readbacks(config, detection, scratch, DescriptorFormat::F32)?;
+        let (data, offsets) = self.read_descriptor_buffers(scratch, &readbacks)?;
+        Ok(decode_f32_descriptors::<D>(
+            &data,
+            &readbacks,
+            &offsets,
+            detection.features.len(),
+        ))
+    }
+
+    fn describe_u8(
+        &self,
+        config: &SiftExtractor,
+        detection: &Detection,
+        scratch: &mut Scratch,
+    ) -> Result<Vec<Option<U8Descriptor>>, RunError> {
+        let readbacks =
+            self.encode_descriptor_readbacks(config, detection, scratch, DescriptorFormat::U8)?;
+        let (data, offsets) = self.read_descriptor_buffers(scratch, &readbacks)?;
+        Ok(decode_u8_descriptors(
+            &data,
+            &readbacks,
+            &offsets,
+            detection.features.len(),
+        ))
+    }
+
+    fn encode_descriptor_readbacks(
+        &self,
+        config: &SiftExtractor,
+        detection: &Detection,
+        scratch: &mut Scratch,
+        format: DescriptorFormat,
+    ) -> Result<Vec<DescriptorReadback>, RunError> {
         let mut descriptor_readbacks = Vec::new();
         for (octave_index, octave) in detection.octaves.iter().enumerate() {
             let mut keys = Vec::new();
@@ -1150,12 +1221,9 @@ impl Engine {
                 .ok_or(RunError::Capacity {
                     what: "descriptor keys",
                 })?;
-            let value_bytes = key_count
-                .checked_mul(SIFT_DESCR_SIZE)
-                .and_then(|count| count.checked_mul(core::mem::size_of::<f32>()))
-                .ok_or(RunError::Capacity {
-                    what: "descriptors",
-                })?;
+            let value_bytes = format.value_bytes(key_count).ok_or(RunError::Capacity {
+                what: "descriptors",
+            })?;
             let valid_bytes =
                 key_count
                     .checked_mul(core::mem::size_of::<u32>())
@@ -1193,7 +1261,7 @@ impl Engine {
                     key_count: key_count as u32,
                     out_off: 0,
                     gauss_off: 0,
-                    pad: 0,
+                    quantize_u8: format.quantize_u8(),
                 },
             );
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1246,39 +1314,20 @@ impl Engine {
                 feature_indices,
             });
         }
+        Ok(descriptor_readbacks)
+    }
 
-        let mut descriptor_ranges = Vec::with_capacity(descriptor_readbacks.len() * 2);
-        for readback in &descriptor_readbacks {
-            descriptor_ranges.push((&readback.valid, readback.valid_bytes));
-            descriptor_ranges.push((&readback.values, readback.value_bytes));
+    fn read_descriptor_buffers(
+        &self,
+        scratch: &mut Scratch,
+        readbacks: &[DescriptorReadback],
+    ) -> Result<(Vec<u8>, Vec<usize>), RunError> {
+        let mut ranges = Vec::with_capacity(readbacks.len() * 2);
+        for readback in readbacks {
+            ranges.push((&readback.valid, readback.valid_bytes));
+            ranges.push((&readback.values, readback.value_bytes));
         }
-        let (descriptor_data, descriptor_offsets) = read_buffers(
-            &self.device,
-            &self.queue,
-            &mut scratch.staging,
-            &descriptor_ranges,
-        )?;
-        for (readback, offsets) in descriptor_readbacks
-            .iter()
-            .zip(descriptor_offsets.as_chunks::<2>().0)
-        {
-            let valid_offset = offsets[0];
-            let values_offset = offsets[1];
-            for local in 0..readback.key_count {
-                if read_u32(&descriptor_data, valid_offset + local * 4) == 0 {
-                    continue;
-                }
-                let base = values_offset + local * SIFT_DESCR_SIZE * 4;
-                let mut values = [0.0f32; SIFT_DESCR_SIZE];
-                for (index, value) in values.iter_mut().enumerate() {
-                    *value = read_f32(&descriptor_data, base + index * 4);
-                }
-                if let Ok(descriptor) = D::try_from_finalized(&values) {
-                    descriptors[readback.feature_indices[local]] = Some(descriptor);
-                }
-            }
-        }
-        Ok(descriptors)
+        read_buffers(&self.device, &self.queue, &mut scratch.staging, &ranges)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2015,6 +2064,77 @@ fn read_buffers(
     Ok((data, offsets))
 }
 
+fn assemble_features<D>(
+    detection: Detection,
+    descriptors: Vec<Option<D>>,
+) -> ScaleSpaceFeatures<D> {
+    let mut features = ScaleSpaceFeatures::default();
+    features.keypoints.reserve(detection.features.len());
+    features.descriptors.reserve(detection.features.len());
+    for (feature, descriptor) in detection.features.into_iter().zip(descriptors) {
+        if let Some(descriptor) = descriptor {
+            features.keypoints.push(feature.geometry());
+            features.descriptors.push(descriptor);
+        }
+    }
+    features
+}
+
+fn decode_f32_descriptors<D: DescriptorStorage>(
+    data: &[u8],
+    readbacks: &[DescriptorReadback],
+    offsets: &[usize],
+    feature_count: usize,
+) -> Vec<Option<D>> {
+    let mut descriptors: Vec<Option<D>> = (0..feature_count).map(|_| None).collect();
+    for (readback, offsets) in readbacks.iter().zip(offsets.as_chunks::<2>().0) {
+        let valid_offset = offsets[0];
+        let values_offset = offsets[1];
+        for local in 0..readback.key_count {
+            if read_u32(data, valid_offset + local * 4) == 0 {
+                continue;
+            }
+            let base = values_offset + local * SIFT_DESCR_SIZE * 4;
+            let mut values = [0.0f32; SIFT_DESCR_SIZE];
+            for (index, value) in values.iter_mut().enumerate() {
+                *value = read_f32(data, base + index * 4);
+            }
+            if let Ok(descriptor) = D::try_from_finalized(&values) {
+                descriptors[readback.feature_indices[local]] = Some(descriptor);
+            }
+        }
+    }
+    descriptors
+}
+
+fn decode_u8_descriptors(
+    data: &[u8],
+    readbacks: &[DescriptorReadback],
+    offsets: &[usize],
+    feature_count: usize,
+) -> Vec<Option<U8Descriptor>> {
+    let mut descriptors: Vec<Option<U8Descriptor>> = (0..feature_count).map(|_| None).collect();
+    for (readback, offsets) in readbacks.iter().zip(offsets.as_chunks::<2>().0) {
+        let valid_offset = offsets[0];
+        let values_offset = offsets[1];
+        for local in 0..readback.key_count {
+            if read_u32(data, valid_offset + local * 4) == 0 {
+                continue;
+            }
+            let mut bytes = [0u8; SIFT_DESCR_SIZE];
+            let base = values_offset + local * PACKED_DESCR_WORDS * 4;
+            for (word_index, chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let word = read_u32(data, base + word_index * 4);
+                chunk.copy_from_slice(&word.to_le_bytes());
+            }
+            if let Ok(descriptor) = U8Descriptor::try_new(bytes, 255.0) {
+                descriptors[readback.feature_indices[local]] = Some(descriptor);
+            }
+        }
+    }
+    descriptors
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     let mut word = [0u8; 4];
     word.copy_from_slice(&bytes[offset..offset + 4]);
@@ -2158,7 +2278,7 @@ struct DescParams {
     key_count: u32,
     out_off: u32,
     gauss_off: u32,
-    pad: u32,
+    quantize_u8: u32,
 }
 
 #[repr(C)]
@@ -2434,6 +2554,39 @@ mod tests {
         for (detected, described) in keypoints.iter().zip(described.keypoints()) {
             assert_eq!(detected, described);
         }
+    }
+
+    fn assert_packed_u8_matches_typed(config: SiftExtractor) {
+        let gpu = match SiftGpuExtractor::new(config) {
+            Ok(extractor) => extractor,
+            Err(error) => panic!("GPU extractor unavailable: {error}"),
+        };
+        let image = synthetic_blobs(192);
+        let packed = match gpu.extract_u8(&image) {
+            Ok(features) => features,
+            Err(error) => panic!("packed GPU extraction failed: {error}"),
+        };
+        let typed = match gpu.extract_typed::<U8Descriptor>(&image) {
+            Ok(features) => features,
+            Err(error) => panic!("typed GPU extraction failed: {error}"),
+        };
+        assert_eq!(packed.keypoints(), typed.keypoints());
+        assert_eq!(packed.descriptors().len(), typed.descriptors().len());
+        for (packed, typed) in packed.descriptors().iter().zip(typed.descriptors()) {
+            assert_eq!(packed.as_slice(), typed.as_slice());
+            assert_eq!(packed.scale(), typed.scale());
+        }
+    }
+
+    #[test]
+    fn gpu_packed_u8_matches_typed_storage() {
+        let Some(_) = gpu_or_skip(SiftPreset::Normal) else {
+            return;
+        };
+        assert_packed_u8_matches_typed(SiftExtractor::with_preset(SiftPreset::Normal));
+        assert_packed_u8_matches_typed(
+            SiftExtractor::with_preset(SiftPreset::Normal).with_root_sift(false),
+        );
     }
 
     #[test]
