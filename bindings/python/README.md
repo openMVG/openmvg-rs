@@ -77,7 +77,8 @@ at `(0.5, 0.5)`, so `write_colmap` adds 0.5 to `cx` and `cy`. All arrays are rea
 
 ```python
 reconstruct(image_dir, /, *, engine="incremental", extraction_method="alp", seed=42,
-            intrinsics=None, progress=True, max_workers=None) -> Reconstruction
+            intrinsics=None, camera_model="pinhole-radial1", share_intrinsics=False,
+            progress=True, max_workers=None) -> Reconstruction
 ```
 
 - `image_dir` holds the images directly or in an `images/` subfolder. Images are JPEG, PNG or
@@ -86,6 +87,14 @@ reconstruct(image_dir, /, *, engine="incremental", extraction_method="alp", seed
   as `intrinsics`, gives every image the same fixed intrinsics. Without it, the intrinsics are
   initialized from EXIF metadata and refined during the run; `Reconstruction.intrinsics_mode`
   reports which case applied.
+- `camera_model` is the model of the cameras estimated from EXIF metadata: `"pinhole"`,
+  `"pinhole-radial1"` (the default) or `"pinhole-radial2"`, whose radial distortion starts unknown
+  and is estimated, or `"spherical"` for 2:1 equirectangular images. A `K.txt` calibration keeps
+  its own pinhole camera. The names are those of `openmvg-sfm --camera-model`.
+- An image without EXIF camera make and model gets a camera of its own. `share_intrinsics=True`
+  gives such images, when they have the same size, one shared camera whose focal length and
+  distortion are estimated from all of them, as `openmvg-sfm --share-intrinsics` does. Frames
+  extracted from one video need it.
 - `engine="incremental"` adds views one at a time; `engine="global"` estimates all their poses
   at once from the pairwise geometry.
 - `extraction_method="alp"`, the default, detects features with ALP (Analytic Laplacian
@@ -105,6 +114,9 @@ forked after a run (multiprocessing's `fork` start method) can call `reconstruct
 
 - Give a `K.txt` when you know the camera. Its intrinsics stay fixed, instead of being
   initialized from EXIF metadata and estimated during the run.
+- For frames extracted from a video, or other images from one camera without EXIF, pass
+  `share_intrinsics=True`, and `camera_model="pinhole-radial2"` when the lens distorts visibly.
+  Without it every frame gets its own focal length, and the poses drift.
 - Start with `engine="incremental"`, which tries to register every image. `engine="global"`
   keeps only the images whose poses pass its consistency checks, and raises
   `NoReconstructionError` when none do; `unregistered_images` lists the images a run left out.

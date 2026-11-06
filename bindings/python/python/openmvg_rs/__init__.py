@@ -83,6 +83,7 @@ __all__ = [
 
 _ENGINES = ("incremental", "global")
 _EXTRACTION_METHODS = ("sift", "alp")
+_CAMERA_MODELS = ("pinhole", "pinhole-radial1", "pinhole-radial2", "spherical")
 
 # Rayon's global thread pool does not survive fork(): a child forked after a run would wait
 # forever for threads that do not exist in the child, so its runs use a private pool instead (0
@@ -116,6 +117,10 @@ def reconstruct(
     extraction_method: Literal["sift", "alp"] = "alp",
     seed: SupportsIndex = 42,
     intrinsics: str | os.PathLike[str] | None = None,
+    camera_model: Literal[
+        "pinhole", "pinhole-radial1", "pinhole-radial2", "spherical"
+    ] = "pinhole-radial1",
+    share_intrinsics: bool = False,
     progress: bool = True,
     max_workers: SupportsIndex | None = None,
 ) -> Reconstruction:
@@ -124,6 +129,8 @@ def reconstruct(
     ``image_dir`` holds the images directly or in an ``images/`` subfolder. A ``K.txt`` file (a
     3x3 camera matrix) in ``image_dir`` or next to the images gives every image the same fixed
     intrinsics; otherwise they are initialized from EXIF metadata and refined during the run.
+    An image without EXIF camera make and model gets a camera of its own unless
+    ``share_intrinsics`` is set.
 
     Args:
         image_dir: The image folder.
@@ -134,6 +141,14 @@ def reconstruct(
         seed: Seed of every randomized step; the same inputs and seed give the same result.
             An integer in ``0 <= seed < 2**64``.
         intrinsics: A ``K.txt`` file to use instead of the one in the image folder.
+        camera_model: Model of the cameras estimated from EXIF metadata: ``"pinhole"`` (no
+            distortion), ``"pinhole-radial1"`` (the default) or ``"pinhole-radial2"`` (one or
+            two radial coefficients, estimated during the run), or ``"spherical"`` for 2:1
+            equirectangular images. A ``K.txt`` calibration keeps its own pinhole camera.
+        share_intrinsics: Give the images with no EXIF camera make and model, and the same
+            dimensions, one shared camera, as frames extracted from one video need; one focal
+            length and distortion are then estimated from all of them. Use it only when they
+            come from one camera at one zoom setting.
         progress: Draw progress bars on stderr when it is a terminal.
         max_workers: Maximum number of compute worker threads; ``None`` uses all cores.
 
@@ -143,7 +158,8 @@ def reconstruct(
 
     Raises:
         TypeError: An argument has the wrong type.
-        ValueError: ``engine``, ``extraction_method``, ``seed`` or ``max_workers`` has an invalid value.
+        ValueError: ``engine``, ``extraction_method``, ``camera_model``, ``seed`` or
+            ``max_workers`` has an invalid value.
         FileNotFoundError: ``image_dir``, an image or the calibration file does not exist.
         PermissionError: The operating system refuses to read an image or the calibration file.
         DatasetError: The folder has no usable images or the calibration is malformed.
@@ -165,6 +181,15 @@ def reconstruct(
         raise ValueError("extraction_method must be 'sift' or 'alp'")
     root_seed = _arguments.seed(seed)
     calibration = None if intrinsics is None else _path("intrinsics", intrinsics)
+    if not isinstance(camera_model, str):
+        raise TypeError(f"camera_model must be a str, not {type(camera_model).__name__}")
+    if camera_model not in _CAMERA_MODELS:
+        raise ValueError(
+            "camera_model must be 'pinhole', 'pinhole-radial1', 'pinhole-radial2' or "
+            f"'spherical', not {camera_model!r}"
+        )
+    if not isinstance(share_intrinsics, bool):
+        raise TypeError(f"share_intrinsics must be a bool, not {type(share_intrinsics).__name__}")
     if not isinstance(progress, bool):
         raise TypeError(f"progress must be a bool, not {type(progress).__name__}")
     workers = None
@@ -177,7 +202,15 @@ def reconstruct(
     else:
         _global_pool_started = True
     return _reconstruct(
-        directory, engine, root_seed, calibration, progress, workers, extraction_method
+        directory,
+        engine,
+        root_seed,
+        calibration,
+        progress,
+        workers,
+        extraction_method,
+        camera_model,
+        share_intrinsics,
     )
 
 

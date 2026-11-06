@@ -6,6 +6,22 @@ This file lists the notable changes to the OpenMVG-rs crates. The format follows
 the `openmvg` umbrella and `openmvg-cli`) are released together and share one version. Before 1.0, a minor release can
 break the API. [MIGRATION.md](MIGRATION.md) states the compatibility rules.
 
+## [Unreleased]
+
+### Added
+
+#### `openmvg-sfm`
+
+- `DatasetConfig::with_camera_model` and `DatasetConfig::with_share_unknown_cameras`, so
+  `Dataset::from_dir_with` can declare the camera model of EXIF groups and give images without
+  EXIF camera make and model one shared camera, as `openmvg-sfm --camera-model` and
+  `--share-intrinsics` do.
+
+#### Python bindings
+
+- `reconstruct(camera_model=..., share_intrinsics=...)`, with the names of the
+  `openmvg-sfm` options: frames extracted from one video can share one estimated camera.
+
 ## [0.1.0] - 2026-10-24
 
 The first published release: a pure-Rust library for multiple view geometry and Structure from

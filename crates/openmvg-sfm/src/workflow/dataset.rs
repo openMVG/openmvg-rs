@@ -55,12 +55,14 @@ impl Dataset {
     }
 
     /// [`Self::from_dir`] with an explicit root seed and, optionally, an explicit calibration
-    /// file.
+    /// file, a camera model, and shared intrinsics for images without EXIF camera make and model.
     ///
     /// An explicit [`DatasetConfig::intrinsics`] file replaces `K.txt` discovery. If it cannot
     /// be read the error is [`crate::SfmError::ReadFile`], and if it is not a valid pinhole
     /// matrix the error is [`crate::SfmError::InvalidInput`]; there is no fallback to discovery
-    /// or EXIF grouping.
+    /// or EXIF grouping. [`DatasetConfig::camera_model`] and
+    /// [`DatasetConfig::share_unknown_cameras`] apply to EXIF grouping only; a calibration file
+    /// keeps its own pinhole camera.
     #[cfg(feature = "image-io")]
     pub fn from_dir_with(
         root: impl AsRef<std::path::Path>,
@@ -84,7 +86,10 @@ impl Dataset {
             },
             None => ImageIntrinsicPolicy::ExifGrouped,
         };
-        let config = ImageDatasetConfig::default().with_intrinsic_policy(intrinsic_policy);
+        let config = ImageDatasetConfig::default()
+            .with_intrinsic_policy(intrinsic_policy)
+            .with_camera_model(options.camera_model())
+            .with_share_unknown_cameras(options.share_unknown_cameras());
         prepare_image_paths(&paths, &config)?.build_dataset(options.seed())
     }
 
@@ -141,8 +146,9 @@ impl Dataset {
 
 /// Explicit inputs of [`Dataset::from_dir_with`].
 ///
-/// The default reproduces [`Dataset::from_dir`]: root seed [`Dataset::DEFAULT_SEED`] and
-/// `K.txt` discovery.
+/// The default reproduces [`Dataset::from_dir`]: root seed [`Dataset::DEFAULT_SEED`], `K.txt`
+/// discovery, `PinholeRadial1` cameras, and one camera per image without EXIF camera make and
+/// model.
 ///
 /// ```no_run
 /// use openmvg_sfm::{Dataset, DatasetConfig};
@@ -153,19 +159,38 @@ impl Dataset {
 /// let dataset = Dataset::from_dir_with("scene", &options)?;
 /// # Ok::<(), openmvg_sfm::SfmError>(())
 /// ```
+///
+/// Frames extracted from one video have no EXIF; share one camera between them, with two
+/// radial coefficients to estimate:
+///
+/// ```no_run
+/// use openmvg_core::camera::CameraModelType;
+/// use openmvg_sfm::{Dataset, DatasetConfig};
+///
+/// let options = DatasetConfig::default()
+///     .with_share_unknown_cameras(true)
+///     .with_camera_model(CameraModelType::PinholeRadial2);
+/// let dataset = Dataset::from_dir_with("frames", &options)?;
+/// # Ok::<(), openmvg_sfm::SfmError>(())
+/// ```
 #[cfg(feature = "image-io")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatasetConfig {
     seed: openmvg_core::RunSeed,
     intrinsics: Option<std::path::PathBuf>,
+    camera_model: openmvg_core::camera::CameraModelType,
+    share_unknown_cameras: bool,
 }
 
 #[cfg(feature = "image-io")]
 impl Default for DatasetConfig {
     fn default() -> Self {
+        let images = crate::image::prepare::ImageDatasetConfig::default();
         Self {
             seed: Dataset::DEFAULT_SEED.into(),
             intrinsics: None,
+            camera_model: images.camera_model(),
+            share_unknown_cameras: images.share_unknown_cameras(),
         }
     }
 }
@@ -174,6 +199,15 @@ impl Default for DatasetConfig {
 config_accessors!(DatasetConfig {
     /// Root of the dataset's deterministic seed tree.
     copy seed, with_seed: openmvg_core::RunSeed;
+    /// Camera model declared for EXIF-grouped cameras: `PinholeSingle`, `PinholeRadial1` (the
+    /// default), `PinholeRadial2`, or `Spherical`; radial coefficients start at zero and are
+    /// estimated. A calibration file keeps its own pinhole camera.
+    copy camera_model, with_camera_model: openmvg_core::camera::CameraModelType;
+    /// Give every image with no camera make and model, and the same dimensions, one shared
+    /// intrinsic group instead of one group per image (default: off), as frames of one video
+    /// need. The images are then asserted to come from one camera at one zoom setting, so a
+    /// single focal length and distortion are estimated from all of them.
+    copy share_unknown_cameras, with_share_unknown_cameras: bool;
 });
 
 #[cfg(feature = "image-io")]
