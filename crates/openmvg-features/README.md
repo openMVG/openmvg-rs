@@ -60,6 +60,8 @@ fn extract(image: &GrayImage) -> Result<(), Box<dyn std::error::Error>> {
 
 The GPU extractor accepts the same `SiftExtractor` configuration and returns the same
 `ScaleSpaceFeatures`, with `detect_keypoints`, `extract_u8`, `extract_f32` and `extract_typed`.
+Create one extractor per device and reuse it for a batch: its scratch buffers stay resident and
+grow only when an image needs more space, so alternating image sizes do not reallocate them.
 It is opt-in: default builds stay CPU-only and `no_std + alloc` builds are unchanged.
 
 ## License

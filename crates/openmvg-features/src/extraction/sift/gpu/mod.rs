@@ -16,9 +16,14 @@
 //! borderline keypoint can differ by a small amount from the CPU path; compare
 //! repeatability and descriptor distance rather than expecting bit equality.
 //!
+//! One extractor is meant to be reused for a batch of images. Its scratch
+//! buffers stay resident and grow only when a later image needs more space,
+//! so repeated and alternating image sizes avoid per-image GPU allocation.
+//!
 //! [`GrayImage`]: crate::extraction::GrayImage
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::extraction::feature_budget::{FeatureBudgetKeypoint, apply_feature_budget};
 use crate::extraction::{
@@ -75,8 +80,8 @@ pub enum SiftGpuError {
 /// GPU implementation of [`SiftExtractor`].
 ///
 /// Create it once and reuse it for images of different sizes. The extractor
-/// owns a wgpu device and reuses its compute pipelines across calls; storage
-/// buffers are allocated per extraction.
+/// owns a wgpu device and reuses its compute pipelines and scratch buffers
+/// across calls; buffers grow only when a later image needs more space.
 /// Use [`Self::extract_u8`], [`Self::extract_f32`], [`Self::extract_typed`] or
 /// [`Self::detect_keypoints`] exactly as with the CPU [`SiftExtractor`].
 ///
@@ -153,12 +158,9 @@ impl SiftGpuExtractor {
         &self,
         image: &GrayImage,
     ) -> Result<Vec<ScaleSpaceKeypoint>, SiftGpuError> {
-        let detection = self.detect_features(image)?;
-        Ok(detection
-            .features
-            .into_iter()
-            .map(Feature::geometry)
-            .collect())
+        self.engine
+            .detect_keypoints(&self.config, image)
+            .map_err(Into::into)
     }
 
     /// Detect and describe with f32 descriptors.
@@ -194,32 +196,8 @@ impl SiftGpuExtractor {
         &self,
         image: &GrayImage,
     ) -> Result<ScaleSpaceFeatures<D>, SiftGpuError> {
-        let detection = self.detect_features(image)?;
-        let descriptors = self.describe::<D>(&detection)?;
-        let mut features = ScaleSpaceFeatures::default();
-        features.keypoints.reserve(detection.features.len());
-        features.descriptors.reserve(detection.features.len());
-        for (feature, descriptor) in detection.features.into_iter().zip(descriptors) {
-            if let Some(descriptor) = descriptor {
-                features.keypoints.push(feature.geometry());
-                features.descriptors.push(descriptor);
-            }
-        }
-        Ok(features)
-    }
-
-    fn detect_features(&self, image: &GrayImage) -> Result<Detection, SiftGpuError> {
         self.engine
-            .detect_features(&self.config, image)
-            .map_err(Into::into)
-    }
-
-    fn describe<D: DescriptorStorage>(
-        &self,
-        detection: &Detection,
-    ) -> Result<Vec<Option<D>>, SiftGpuError> {
-        self.engine
-            .describe::<D>(&self.config, detection)
+            .extract::<D>(&self.config, image)
             .map_err(Into::into)
     }
 }
@@ -291,6 +269,190 @@ struct DescriptorReadback {
 }
 
 // =============================================================================
+// Persistent scratch
+// =============================================================================
+
+/// A storage or staging buffer that is kept between extractions and replaced
+/// only when a later image needs more bytes. Cloning the returned handle is
+/// cheap; it does not allocate device memory.
+#[derive(Default)]
+struct GrowBuffer {
+    buffer: Option<wgpu::Buffer>,
+    #[cfg(test)]
+    allocations: usize,
+}
+
+impl GrowBuffer {
+    fn ensure(
+        &mut self,
+        device: &wgpu::Device,
+        label: &str,
+        bytes: usize,
+        usage: wgpu::BufferUsages,
+    ) -> wgpu::Buffer {
+        let needed = bytes.max(16).div_ceil(4) as u64 * 4;
+        let grow = self
+            .buffer
+            .as_ref()
+            .is_none_or(|buffer| buffer.size() < needed);
+        if grow {
+            self.buffer = Some(create_buffer(device, label, needed, usage));
+            #[cfg(test)]
+            {
+                self.allocations += 1;
+            }
+        }
+        match &self.buffer {
+            Some(buffer) => buffer.clone(),
+            None => create_buffer(device, label, needed, usage),
+        }
+    }
+
+    fn ensure_storage(&mut self, device: &wgpu::Device, label: &str, bytes: usize) -> wgpu::Buffer {
+        self.ensure(
+            device,
+            label,
+            bytes,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        )
+    }
+
+    fn ensure_readback(
+        &mut self,
+        device: &wgpu::Device,
+        label: &str,
+        bytes: usize,
+    ) -> wgpu::Buffer {
+        self.ensure(
+            device,
+            label,
+            bytes,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        )
+    }
+}
+
+#[derive(Default)]
+struct OctaveScratch {
+    gauss: GrowBuffer,
+    dog: GrowBuffer,
+    temp_a: GrowBuffer,
+    temp_b: GrowBuffer,
+    candidates: GrowBuffer,
+    candidate_count: Option<wgpu::Buffer>,
+    refined: GrowBuffer,
+    refined_count: Option<wgpu::Buffer>,
+}
+
+#[derive(Default)]
+struct Scratch {
+    source: GrowBuffer,
+    octaves: Vec<OctaveScratch>,
+    orientation_keys: Vec<GrowBuffer>,
+    orientation_counts: Vec<GrowBuffer>,
+    orientations: Vec<GrowBuffer>,
+    descriptor_keys: Vec<GrowBuffer>,
+    descriptors: Vec<GrowBuffer>,
+    descriptor_valid: Vec<GrowBuffer>,
+    staging: GrowBuffer,
+    blur_weights: BTreeMap<u32, wgpu::Buffer>,
+}
+
+impl Scratch {
+    fn ensure_stage_buffers(&mut self, stages: usize) {
+        if self.octaves.len() < stages {
+            self.octaves.resize_with(stages, OctaveScratch::default);
+        }
+        if self.orientation_keys.len() < stages {
+            self.orientation_keys
+                .resize_with(stages, GrowBuffer::default);
+            self.orientation_counts
+                .resize_with(stages, GrowBuffer::default);
+            self.orientations.resize_with(stages, GrowBuffer::default);
+            self.descriptor_keys
+                .resize_with(stages, GrowBuffer::default);
+            self.descriptors.resize_with(stages, GrowBuffer::default);
+            self.descriptor_valid
+                .resize_with(stages, GrowBuffer::default);
+        }
+    }
+
+    fn counter(
+        slot: &mut Option<wgpu::Buffer>,
+        device: &wgpu::Device,
+        label: &str,
+    ) -> wgpu::Buffer {
+        match slot {
+            Some(buffer) => buffer.clone(),
+            None => {
+                let buffer = storage_buffer(device, label, 16);
+                *slot = Some(buffer.clone());
+                buffer
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn allocations(&self) -> usize {
+        let octaves = self
+            .octaves
+            .iter()
+            .map(|octave| {
+                octave.gauss.allocations
+                    + octave.dog.allocations
+                    + octave.temp_a.allocations
+                    + octave.temp_b.allocations
+                    + octave.candidates.allocations
+                    + octave.refined.allocations
+            })
+            .sum::<usize>();
+        let stages = self
+            .orientation_keys
+            .iter()
+            .map(|buffer| buffer.allocations)
+            .sum::<usize>()
+            + self
+                .orientation_counts
+                .iter()
+                .map(|buffer| buffer.allocations)
+                .sum::<usize>()
+            + self
+                .orientations
+                .iter()
+                .map(|buffer| buffer.allocations)
+                .sum::<usize>()
+            + self
+                .descriptor_keys
+                .iter()
+                .map(|buffer| buffer.allocations)
+                .sum::<usize>()
+            + self
+                .descriptors
+                .iter()
+                .map(|buffer| buffer.allocations)
+                .sum::<usize>()
+            + self
+                .descriptor_valid
+                .iter()
+                .map(|buffer| buffer.allocations)
+                .sum::<usize>();
+        let counters = self
+            .octaves
+            .iter()
+            .filter(|octave| octave.candidate_count.is_some())
+            .count()
+            + self
+                .octaves
+                .iter()
+                .filter(|octave| octave.refined_count.is_some())
+                .count();
+        self.source.allocations + octaves + stages + counters + self.staging.allocations
+    }
+}
+
+// =============================================================================
 // wgpu engine
 // =============================================================================
 
@@ -300,6 +462,7 @@ struct Engine {
     queue: wgpu::Queue,
     pipelines: Pipelines,
     layouts: Layouts,
+    scratch: Mutex<Scratch>,
 }
 
 struct Layouts {
@@ -350,7 +513,14 @@ impl Engine {
             queue,
             pipelines,
             layouts,
+            scratch: Mutex::new(Scratch::default()),
         })
+    }
+
+    fn lock_scratch(&self) -> Result<MutexGuard<'_, Scratch>, RunError> {
+        self.scratch
+            .lock()
+            .map_err(|_| RunError::Readback("GPU scratch lock is poisoned".to_string()))
     }
 
     fn ensure_storage_capacity(&self, bytes: usize) -> Result<(), RunError> {
@@ -364,10 +534,45 @@ impl Engine {
         Ok(())
     }
 
+    fn detect_keypoints(
+        &self,
+        config: &SiftExtractor,
+        image: &GrayImage,
+    ) -> Result<Vec<ScaleSpaceKeypoint>, RunError> {
+        let mut scratch = self.lock_scratch()?;
+        let detection = self.detect_features(config, image, &mut scratch)?;
+        Ok(detection
+            .features
+            .into_iter()
+            .map(Feature::geometry)
+            .collect())
+    }
+
+    fn extract<D: DescriptorStorage>(
+        &self,
+        config: &SiftExtractor,
+        image: &GrayImage,
+    ) -> Result<ScaleSpaceFeatures<D>, RunError> {
+        let mut scratch = self.lock_scratch()?;
+        let detection = self.detect_features(config, image, &mut scratch)?;
+        let descriptors = self.describe::<D>(config, &detection, &mut scratch)?;
+        let mut features = ScaleSpaceFeatures::default();
+        features.keypoints.reserve(detection.features.len());
+        features.descriptors.reserve(detection.features.len());
+        for (feature, descriptor) in detection.features.into_iter().zip(descriptors) {
+            if let Some(descriptor) = descriptor {
+                features.keypoints.push(feature.geometry());
+                features.descriptors.push(descriptor);
+            }
+        }
+        Ok(features)
+    }
+
     fn detect_features(
         &self,
         config: &SiftExtractor,
         image: &GrayImage,
+        scratch: &mut Scratch,
     ) -> Result<Detection, RunError> {
         let height = image.nrows();
         let width = image.ncols();
@@ -406,6 +611,7 @@ impl Engine {
             ((sigma_min * sigma_min - ASSUMED_INPUT_SIGMA * ASSUMED_INPUT_SIGMA).max(0.0)).sqrt()
                 / delta_min;
 
+        scratch.ensure_stage_buffers(num_octaves);
         let mut octaves = Vec::with_capacity(num_octaves);
         let mut dog_buffers = Vec::with_capacity(num_octaves);
         let mut temp_as = Vec::with_capacity(num_octaves);
@@ -442,31 +648,56 @@ impl Engine {
             self.ensure_storage_capacity(gauss_bytes)?;
             self.ensure_storage_capacity(dog_bytes)?;
             self.ensure_storage_capacity(temp_bytes)?;
-            let gauss = storage_buffer(&self.device, "omvg-sift-gauss", gauss_bytes as u64);
-            let dog = storage_buffer(&self.device, "omvg-sift-dog", dog_bytes as u64);
-            let temp_a = storage_buffer(&self.device, "omvg-sift-temp-a", temp_bytes as u64);
-            let temp_b = storage_buffer(&self.device, "omvg-sift-temp-b", temp_bytes as u64);
+            let slot = &mut scratch.octaves[octave];
+            let gauss = slot
+                .gauss
+                .ensure_storage(&self.device, "omvg-sift-gauss", gauss_bytes);
+            let dog = slot
+                .dog
+                .ensure_storage(&self.device, "omvg-sift-dog", dog_bytes);
+            let temp_a = slot
+                .temp_a
+                .ensure_storage(&self.device, "omvg-sift-temp-a", temp_bytes);
+            let temp_b = slot
+                .temp_b
+                .ensure_storage(&self.device, "omvg-sift-temp-b", temp_bytes);
 
             let voxels = (rows.saturating_sub(2))
                 .saturating_mul(cols.saturating_sub(2))
                 .saturating_mul(dogs);
-            let capacity = (voxels / CANDIDATE_DIVISOR).max(MIN_CANDIDATES);
-            let candidate_bytes = capacity
+            let requested_capacity = (voxels / CANDIDATE_DIVISOR).max(MIN_CANDIDATES);
+            let candidate_bytes = requested_capacity
                 .checked_mul(CANDIDATE_BYTES)
                 .ok_or(RunError::Capacity { what: "candidate" })?;
+            self.ensure_storage_capacity(candidate_bytes)?;
+            let candidate_buffer = slot.candidates.ensure_storage(
+                &self.device,
+                "omvg-sift-candidates",
+                candidate_bytes,
+            );
+            let capacity = (candidate_buffer.size() / CANDIDATE_BYTES as u64) as usize;
+            if capacity > u32::MAX as usize {
+                return Err(RunError::Capacity { what: "candidate" });
+            }
             let refined_bytes = capacity
                 .checked_mul(REFINED_BYTES)
                 .ok_or(RunError::Capacity {
                     what: "refined keypoint",
                 })?;
-            self.ensure_storage_capacity(candidate_bytes)?;
             self.ensure_storage_capacity(refined_bytes)?;
-            let candidate_buffer =
-                storage_buffer(&self.device, "omvg-sift-candidates", candidate_bytes as u64);
-            let candidate_count = storage_buffer(&self.device, "omvg-sift-candidate-count", 16);
             let refined_buffer =
-                storage_buffer(&self.device, "omvg-sift-refined", refined_bytes as u64);
-            let refined_count = storage_buffer(&self.device, "omvg-sift-refined-count", 16);
+                slot.refined
+                    .ensure_storage(&self.device, "omvg-sift-refined", refined_bytes);
+            let candidate_count = Scratch::counter(
+                &mut slot.candidate_count,
+                &self.device,
+                "omvg-sift-candidate-count",
+            );
+            let refined_count = Scratch::counter(
+                &mut slot.refined_count,
+                &self.device,
+                "omvg-sift-refined-count",
+            );
 
             octaves.push(Octave {
                 rows,
@@ -489,7 +720,9 @@ impl Engine {
             .and_then(|pixels| pixels.checked_mul(core::mem::size_of::<f32>()))
             .ok_or(RunError::Capacity { what: "input" })?;
         self.ensure_storage_capacity(source_bytes)?;
-        let source = storage_buffer(&self.device, "omvg-sift-input", source_bytes as u64);
+        let source = scratch
+            .source
+            .ensure_storage(&self.device, "omvg-sift-input", source_bytes);
         self.queue
             .write_buffer(&source, 0, bytemuck::cast_slice(image.as_slice()));
 
@@ -517,6 +750,7 @@ impl Engine {
         if sigma_extra > 0.01 {
             self.encode_blur_pair(
                 &mut encoder,
+                scratch,
                 &temp_as[0],
                 &temp_bs[0],
                 &octaves[0].gauss,
@@ -572,6 +806,7 @@ impl Engine {
                         .max(0.01);
                 self.encode_blur_pair(
                     &mut encoder,
+                    scratch,
                     &octaves[octave].gauss,
                     &temp_as[octave],
                     &octaves[octave].gauss,
@@ -666,7 +901,12 @@ impl Engine {
             count_ranges.push((&candidate_counts[octave], core::mem::size_of::<u32>()));
             count_ranges.push((&refined_counts[octave], core::mem::size_of::<u32>()));
         }
-        let (count_data, count_offsets) = read_buffers(&self.device, &self.queue, &count_ranges)?;
+        let (count_data, count_offsets) = read_buffers(
+            &self.device,
+            &self.queue,
+            &mut scratch.staging,
+            &count_ranges,
+        )?;
         let mut refined_totals = Vec::with_capacity(num_octaves);
         for octave in 0..num_octaves {
             let candidate_count = read_u32(&count_data, count_offsets[octave * 2]) as usize;
@@ -684,8 +924,12 @@ impl Engine {
                 refined_totals[octave] * REFINED_BYTES,
             ));
         }
-        let (refined_data, refined_offsets) =
-            read_buffers(&self.device, &self.queue, &refined_ranges)?;
+        let (refined_data, refined_offsets) = read_buffers(
+            &self.device,
+            &self.queue,
+            &mut scratch.staging,
+            &refined_ranges,
+        )?;
         let mut refined = Vec::new();
         for octave in 0..num_octaves {
             let refined_count = refined_totals[octave];
@@ -758,19 +1002,22 @@ impl Engine {
             self.ensure_storage_capacity(key_bytes)?;
             self.ensure_storage_capacity(count_bytes)?;
             self.ensure_storage_capacity(orientation_bytes)?;
-            let key_buffer =
-                storage_buffer(&self.device, "omvg-sift-orientation-keys", key_bytes as u64);
+            let key_buffer = scratch.orientation_keys[octave].ensure_storage(
+                &self.device,
+                "omvg-sift-orientation-keys",
+                key_bytes,
+            );
             self.queue
                 .write_buffer(&key_buffer, 0, bytemuck::cast_slice(&keys));
-            let counts = storage_buffer(
+            let counts = scratch.orientation_counts[octave].ensure_storage(
                 &self.device,
                 "omvg-sift-orientation-counts",
-                count_bytes as u64,
+                count_bytes,
             );
-            let orientations = storage_buffer(
+            let orientations = scratch.orientations[octave].ensure_storage(
                 &self.device,
                 "omvg-sift-orientations",
-                orientation_bytes as u64,
+                orientation_bytes,
             );
             let uniform = uniform_buffer(
                 &self.device,
@@ -842,12 +1089,16 @@ impl Engine {
             orientation_ranges.push((&readback.counts, readback.count_bytes));
             orientation_ranges.push((&readback.orientations, readback.orientation_bytes));
         }
-        let (orientation_data, orientation_offsets) =
-            read_buffers(&self.device, &self.queue, &orientation_ranges)?;
+        let (orientation_data, orientation_offsets) = read_buffers(
+            &self.device,
+            &self.queue,
+            &mut scratch.staging,
+            &orientation_ranges,
+        )?;
         let mut oriented = Vec::new();
         for (readback, offsets) in orientation_readbacks
             .iter()
-            .zip(orientation_offsets.chunks_exact(2))
+            .zip(orientation_offsets.as_chunks::<2>().0)
         {
             let count_offset = offsets[0];
             let orientation_offset = offsets[1];
@@ -871,6 +1122,7 @@ impl Engine {
         &self,
         config: &SiftExtractor,
         detection: &Detection,
+        scratch: &mut Scratch,
     ) -> Result<Vec<Option<D>>, RunError> {
         let mut descriptors: Vec<Option<D>> = (0..detection.features.len()).map(|_| None).collect();
         let mut descriptor_readbacks = Vec::new();
@@ -913,15 +1165,22 @@ impl Engine {
             self.ensure_storage_capacity(key_bytes)?;
             self.ensure_storage_capacity(value_bytes)?;
             self.ensure_storage_capacity(valid_bytes)?;
-            let key_buffer =
-                storage_buffer(&self.device, "omvg-sift-descriptor-keys", key_bytes as u64);
+            let key_buffer = scratch.descriptor_keys[octave_index].ensure_storage(
+                &self.device,
+                "omvg-sift-descriptor-keys",
+                key_bytes,
+            );
             self.queue
                 .write_buffer(&key_buffer, 0, bytemuck::cast_slice(&keys));
-            let values = storage_buffer(&self.device, "omvg-sift-descriptors", value_bytes as u64);
-            let valid = storage_buffer(
+            let values = scratch.descriptors[octave_index].ensure_storage(
+                &self.device,
+                "omvg-sift-descriptors",
+                value_bytes,
+            );
+            let valid = scratch.descriptor_valid[octave_index].ensure_storage(
                 &self.device,
                 "omvg-sift-descriptor-valid",
-                valid_bytes as u64,
+                valid_bytes,
             );
             let uniform = uniform_buffer(
                 &self.device,
@@ -993,11 +1252,15 @@ impl Engine {
             descriptor_ranges.push((&readback.valid, readback.valid_bytes));
             descriptor_ranges.push((&readback.values, readback.value_bytes));
         }
-        let (descriptor_data, descriptor_offsets) =
-            read_buffers(&self.device, &self.queue, &descriptor_ranges)?;
+        let (descriptor_data, descriptor_offsets) = read_buffers(
+            &self.device,
+            &self.queue,
+            &mut scratch.staging,
+            &descriptor_ranges,
+        )?;
         for (readback, offsets) in descriptor_readbacks
             .iter()
-            .zip(descriptor_offsets.chunks_exact(2))
+            .zip(descriptor_offsets.as_chunks::<2>().0)
         {
             let valid_offset = offsets[0];
             let values_offset = offsets[1];
@@ -1082,6 +1345,7 @@ impl Engine {
     fn encode_blur_pair(
         &self,
         encoder: &mut wgpu::CommandEncoder,
+        scratch: &mut Scratch,
         source: &wgpu::Buffer,
         temp_a: &wgpu::Buffer,
         destination: &wgpu::Buffer,
@@ -1095,16 +1359,8 @@ impl Engine {
     ) {
         let kernel = gaussian_weights(sigma);
         let radius = kernel.len().saturating_sub(1);
-        let weight_bytes = (kernel.len() * core::mem::size_of::<f32>()) as u64;
-        let weight_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("omvg-sift-blur-weights"),
-            size: weight_bytes.max(16),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue
-            .write_buffer(&weight_buffer, 0, bytemuck::cast_slice(&kernel));
-        keep_buffers.push(weight_buffer.clone());
+        let weight_buffer =
+            cached_gaussian_weights(&self.device, &self.queue, scratch, sigma, &kernel);
 
         self.encode_blur(
             encoder,
@@ -1667,15 +1923,27 @@ const fn storage(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 // Host-side layouts and helpers
 // =============================================================================
 
-fn storage_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
+fn create_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    bytes: u64,
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: bytes.max(16).div_ceil(4) * 4,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
+        usage,
         mapped_at_creation: false,
     })
+}
+
+fn storage_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
+    create_buffer(
+        device,
+        label,
+        bytes,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+    )
 }
 
 fn uniform_buffer<T: bytemuck::Pod>(
@@ -1698,6 +1966,7 @@ fn uniform_buffer<T: bytemuck::Pod>(
 fn read_buffers(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    staging_buffer: &mut GrowBuffer,
     ranges: &[(&wgpu::Buffer, usize)],
 ) -> Result<(Vec<u8>, Vec<usize>), RunError> {
     let mut offsets = Vec::with_capacity(ranges.len());
@@ -1715,12 +1984,7 @@ fn read_buffers(
     if total == 0 {
         return Ok((Vec::new(), offsets));
     }
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("omvg-sift-staging"),
-        size: total as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let staging = staging_buffer.ensure_readback(device, "omvg-sift-staging", total);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("omvg-sift-staging"),
     });
@@ -1731,7 +1995,7 @@ fn read_buffers(
         }
     }
     queue.submit(Some(encoder.finish()));
-    let slice = staging.slice(..);
+    let slice = staging.slice(..total as u64);
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
@@ -1776,6 +2040,24 @@ fn gaussian_weights(sigma: f32) -> Vec<f32> {
     (0..=radius)
         .map(|offset| full[radius + offset] / sum)
         .collect()
+}
+
+fn cached_gaussian_weights(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scratch: &mut Scratch,
+    sigma: f32,
+    kernel: &[f32],
+) -> wgpu::Buffer {
+    let key = sigma.to_bits();
+    if let Some(buffer) = scratch.blur_weights.get(&key) {
+        return buffer.clone();
+    }
+    let bytes = kernel.len().saturating_mul(core::mem::size_of::<f32>());
+    let buffer = storage_buffer(device, "omvg-sift-blur-weights", bytes as u64);
+    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(kernel));
+    scratch.blur_weights.insert(key, buffer.clone());
+    buffer
 }
 
 // =============================================================================
@@ -1945,6 +2227,12 @@ mod tests {
     use super::*;
     use crate::extraction::FeatureBudgetPolicy;
 
+    #[test]
+    fn gpu_extractor_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SiftGpuExtractor>();
+    }
+
     fn synthetic_blobs(size: usize) -> GrayImage {
         let mut image = GrayImage::zeros(size, size);
         let blobs = [
@@ -1972,6 +2260,13 @@ mod tests {
             Ok(extractor) => Some(extractor),
             Err(SiftGpuError::NoAdapter) => None,
             Err(error) => panic!("GPU extractor unavailable: {error}"),
+        }
+    }
+
+    fn scratch_allocations(gpu: &SiftGpuExtractor) -> usize {
+        match gpu.engine.scratch.lock() {
+            Ok(scratch) => scratch.allocations(),
+            Err(error) => panic!("GPU scratch lock poisoned: {error}"),
         }
     }
 
@@ -2187,6 +2482,77 @@ mod tests {
         for descriptor in features.descriptors() {
             assert!(descriptor.as_slice().iter().all(|value| value.is_finite()));
         }
+    }
+
+    #[test]
+    fn gpu_scratch_is_reused_across_images_and_sizes() {
+        let Some(gpu) = gpu_or_skip(SiftPreset::Normal) else {
+            return;
+        };
+        let small = synthetic_blobs(128);
+        let large = synthetic_blobs(256);
+
+        let first = match gpu.extract_u8(&small) {
+            Ok(features) => features,
+            Err(error) => panic!("first GPU extraction failed: {error}"),
+        };
+        let after_first = scratch_allocations(&gpu);
+        assert!(
+            after_first > 0,
+            "the first extraction must allocate scratch"
+        );
+
+        let repeated = match gpu.extract_u8(&small) {
+            Ok(features) => features,
+            Err(error) => panic!("repeated GPU extraction failed: {error}"),
+        };
+        assert_eq!(
+            scratch_allocations(&gpu),
+            after_first,
+            "a repeated image size must reuse every scratch buffer"
+        );
+        assert_eq!(first.keypoints(), repeated.keypoints());
+        assert_eq!(first.descriptors(), repeated.descriptors());
+
+        let larger = match gpu.extract_u8(&large) {
+            Ok(features) => features,
+            Err(error) => panic!("larger GPU extraction failed: {error}"),
+        };
+        assert!(!larger.keypoints().is_empty());
+        let after_large = scratch_allocations(&gpu);
+        assert!(
+            after_large > after_first,
+            "a larger image must grow at least one scratch buffer"
+        );
+
+        let _ = match gpu.extract_u8(&small) {
+            Ok(features) => features,
+            Err(error) => panic!("small image after large failed: {error}"),
+        };
+        assert_eq!(
+            scratch_allocations(&gpu),
+            after_large,
+            "a smaller image must reuse the larger buffers"
+        );
+
+        let _ = match gpu.extract_u8(&large) {
+            Ok(features) => features,
+            Err(error) => panic!("repeated large image failed: {error}"),
+        };
+        assert_eq!(scratch_allocations(&gpu), after_large);
+
+        let flat = GrayImage::zeros(256, 256);
+        let flat_features = match gpu.extract_u8(&flat) {
+            Ok(features) => features,
+            Err(error) => panic!("featureless GPU extraction failed: {error}"),
+        };
+        assert!(flat_features.keypoints().is_empty());
+        assert!(flat_features.descriptors().is_empty());
+        assert_eq!(
+            scratch_allocations(&gpu),
+            after_large,
+            "a featureless image must not allocate result buffers"
+        );
     }
 
     #[test]
