@@ -65,6 +65,11 @@ harness = false
 required-features = ["std"]
 
 [[bench]]
+name = "gpu_sift_benchmark"
+harness = false
+required-features = ["gpu", "parallel"]
+
+[[bench]]
 name = "tracking_benchmark"
 harness = false
 required-features = ["std"]
