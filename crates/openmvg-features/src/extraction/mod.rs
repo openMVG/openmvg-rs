@@ -148,6 +148,9 @@ pub use feature_budget::{
     StrongestResponseBudget, apply_feature_budget,
 };
 pub use sift::{SiftError, SiftExtractor, SiftPreset};
+#[cfg(feature = "gpu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gpu")))]
+pub use sift::{SiftGpuError, SiftGpuExtractor};
 pub use storage::{
     DescriptorError, DescriptorStorage, F32Descriptor, SIFT_DESCRIPTOR_DIM, U8Descriptor,
 };

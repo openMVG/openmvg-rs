@@ -7,10 +7,14 @@
 pub(crate) mod canonical_descriptor;
 pub(crate) mod common;
 mod detector;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod localization;
 mod scale_space;
 
 pub use detector::SiftExtractor;
+#[cfg(feature = "gpu")]
+pub use gpu::{SiftGpuError, SiftGpuExtractor};
 
 // ============================================================================
 // Errors

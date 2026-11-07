@@ -14,7 +14,7 @@ include = ["/src/**", "/examples/**", "/scripts/alp/**", "/Cargo.toml", "/README
 
 # docs.rs documents the native profile; `libm` is the no_std alternative to `std`.
 [package.metadata.docs.rs]
-features = ["std", "parallel"]
+features = ["std", "parallel", "gpu"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -32,14 +32,22 @@ rayon = { workspace = true, optional = true }
 # no_std math
 libm = { version = "0.2", optional = true }
 
+# Optional GPU SIFT backend; see the `gpu` feature below.
+bytemuck = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+
 [features]
 default = ["std", "parallel"]
 std = ["nalgebra/std", "dep:thiserror", "dep:openmvg-core", "dep:serde", "dep:pulp"]
 parallel = ["std", "dep:rayon"]
 libm = ["nalgebra/libm", "dep:libm"]
+gpu = ["std", "dep:bytemuck", "dep:pollster", "dep:wgpu"]
+gpu-fused-blur = ["gpu"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+image = { workspace = true }
 rand = { workspace = true, features = ["std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -57,6 +65,11 @@ required-features = ["std"]
 name = "matcher_benchmark"
 harness = false
 required-features = ["std"]
+
+[[bench]]
+name = "gpu_sift_benchmark"
+harness = false
+required-features = ["gpu", "parallel"]
 
 [[bench]]
 name = "tracking_benchmark"
