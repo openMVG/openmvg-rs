@@ -99,7 +99,8 @@ fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let id = wid.x;
+    // `workgroup_grid` folds more than 65535 keypoints into a second dimension.
+    let id = wid.x + wid.y * 65535u;
     if (id >= p.key_count) {
         return;
     }

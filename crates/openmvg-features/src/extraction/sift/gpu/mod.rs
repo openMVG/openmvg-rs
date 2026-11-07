@@ -3,6 +3,14 @@
 
 //! Optional wgpu backend for the classic SIFT extractor.
 //!
+//! ```text
+//!  image ──pack u8──> init ──> blur + DoG (fused, per level) ──> extrema ──> refine
+//!                                                                              │ counts
+//!  host <── features, orientation counts, first peaks <── orientation <── order + dedup
+//!   │ budget, offsets
+//!   └──> compact keys ──> descriptor (+ u8 quantize) ──> host
+//! ```
+//!
 //! The GPU path follows the CPU detector stage for stage: the hierarchical
 //! Gaussian scale space, DoG extrema, five-step Taylor refinement, orientation
 //! histograms, feature budget and the classic 4x4x8 descriptor. It is intended
@@ -19,12 +27,18 @@
 //! One extractor is meant to be reused for a batch of images. Its scratch
 //! buffers stay resident and grow only when a later image needs more space,
 //! so repeated and alternating image sizes avoid per-image GPU allocation.
-//! The u8 path quantizes on the device and reads back packed bytes, so it
-//! transfers four times fewer descriptor bytes than the f32 path.
+//! An extraction usually has three host round trips: the refined counts, the ordered
+//! features with their orientations, and the descriptors. The host never sorts
+//! or deduplicates; `order.wgsl` does that on the device. An image of exact
+//! 8-bit values is uploaded as bytes, a quarter of its f32 size, and the u8
+//! path quantizes on the device and reads back packed bytes, so it transfers
+//! four times fewer descriptor bytes than the f32 path. Each stage records its
+//! dispatches into one compute pass and writes its parameters with one queue
+//! write.
 //!
 //! [`GrayImage`]: crate::extraction::GrayImage
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::extraction::feature_budget::{FeatureBudgetKeypoint, apply_feature_budget};
@@ -47,8 +61,16 @@ const MIN_CANDIDATES: usize = 256;
 const MAX_ORIENTATIONS: usize = 36;
 const ORIENTATION_PREFIX: usize = 8;
 const CANDIDATE_BYTES: usize = 24;
-const REFINED_BYTES: usize = 56;
+/// One `Refined` record of `refine.wgsl` and `order.wgsl`.
+const REFINED_BYTES: usize = core::mem::size_of::<GpuRefined>();
 const REFINE_WORKGROUPS: u32 = 256;
+/// `NO_COPY` in `order.wgsl`.
+const ORDER_NO_COPY: u32 = u32::MAX;
+const ORDERED_FEATURE_BYTES: usize = core::mem::size_of::<GpuFeature>();
+/// `MAX_RADIUS`, `TILE` and `BLOCK_COLS` in `blur_fused.wgsl`.
+const FUSED_BLUR_MAX_RADIUS: usize = 16;
+const FUSED_BLUR_ROWS: u32 = 32;
+const FUSED_BLUR_COLS: u32 = 64;
 const PACKED_DESCR_WORDS: usize = SIFT_DESCR_SIZE / 4;
 
 // =============================================================================
@@ -268,14 +290,25 @@ struct CompactKeys {
 struct OrientationReadback {
     octave: usize,
     key_count: usize,
-    count_bytes: usize,
     orientation_bytes: usize,
-    prefix_bytes: usize,
+    keys: wgpu::Buffer,
+    counts: wgpu::Buffer,
+    orientations: wgpu::Buffer,
+    indices: Vec<usize>,
+}
+
+/// GPU buffers of one octave after [`Engine::encode_order`]: `work[0]` holds
+/// the number of kept features, which is at most `capacity`, the number of
+/// refined samples.
+struct OrderedOctave {
+    octave: usize,
+    capacity: usize,
+    work: wgpu::Buffer,
+    features: wgpu::Buffer,
     keys: wgpu::Buffer,
     counts: wgpu::Buffer,
     orientations: wgpu::Buffer,
     prefix: wgpu::Buffer,
-    indices: Vec<usize>,
 }
 
 struct OrientationCompaction {
@@ -403,7 +436,10 @@ struct OctaveScratch {
 #[derive(Default)]
 struct Scratch {
     source: GrowBuffer,
+    packed_input: Vec<u32>,
     octaves: Vec<OctaveScratch>,
+    order_work: Vec<GrowBuffer>,
+    ordered_features: Vec<GrowBuffer>,
     orientation_keys: Vec<GrowBuffer>,
     orientation_counts: Vec<GrowBuffer>,
     orientations: Vec<GrowBuffer>,
@@ -413,7 +449,8 @@ struct Scratch {
     descriptors: Vec<GrowBuffer>,
     descriptor_valid: Vec<GrowBuffer>,
     staging: GrowBuffer,
-    blur_weights: BTreeMap<u32, wgpu::Buffer>,
+    blur_weights: BTreeMap<u32, (wgpu::Buffer, usize)>,
+    params: ParamArena,
 }
 
 impl Scratch {
@@ -422,6 +459,9 @@ impl Scratch {
             self.octaves.resize_with(stages, OctaveScratch::default);
         }
         if self.orientation_keys.len() < stages {
+            self.order_work.resize_with(stages, GrowBuffer::default);
+            self.ordered_features
+                .resize_with(stages, GrowBuffer::default);
             self.orientation_keys
                 .resize_with(stages, GrowBuffer::default);
             self.orientation_counts
@@ -471,6 +511,8 @@ impl Scratch {
         let stages = self
             .orientation_keys
             .iter()
+            .chain(&self.order_work)
+            .chain(&self.ordered_features)
             .map(|buffer| buffer.allocations)
             .sum::<usize>()
             + self
@@ -539,24 +581,31 @@ struct Layouts {
     init: wgpu::BindGroupLayout,
     blur: wgpu::BindGroupLayout,
     decimate: wgpu::BindGroupLayout,
-    dog: wgpu::BindGroupLayout,
     extrema: wgpu::BindGroupLayout,
     refine: wgpu::BindGroupLayout,
     orientation: wgpu::BindGroupLayout,
     compact: wgpu::BindGroupLayout,
     describe: wgpu::BindGroupLayout,
+    order: wgpu::BindGroupLayout,
 }
 
 struct Pipelines {
     init: wgpu::ComputePipeline,
     blur: wgpu::ComputePipeline,
+    blur_fused: wgpu::ComputePipeline,
     decimate: wgpu::ComputePipeline,
-    dog: wgpu::ComputePipeline,
     extrema: wgpu::ComputePipeline,
     refine: wgpu::ComputePipeline,
     orientation: wgpu::ComputePipeline,
     compact: wgpu::ComputePipeline,
     describe: wgpu::ComputePipeline,
+    order_hist: wgpu::ComputePipeline,
+    order_scan: wgpu::ComputePipeline,
+    order_scatter: wgpu::ComputePipeline,
+    order_bucket_sort: wgpu::ComputePipeline,
+    order_hash: wgpu::ComputePipeline,
+    order_flag: wgpu::ComputePipeline,
+    order_emit: wgpu::ComputePipeline,
 }
 
 impl Engine {
@@ -636,8 +685,7 @@ impl Engine {
     ) -> Result<ScaleSpaceFeatures<D>, RunError> {
         let mut scratch = self.lock_scratch()?;
         let detection = self.detect_features(config, image, &mut scratch, true)?;
-        let descriptors = self.describe::<D>(config, &detection, &mut scratch)?;
-        Ok(assemble_features(detection, descriptors))
+        self.describe::<D>(config, &detection, &mut scratch)
     }
 
     fn extract_u8(
@@ -647,8 +695,49 @@ impl Engine {
     ) -> Result<ScaleSpaceFeatures<U8Descriptor>, RunError> {
         let mut scratch = self.lock_scratch()?;
         let detection = self.detect_features(config, image, &mut scratch, true)?;
-        let descriptors = self.describe_u8(config, &detection, &mut scratch)?;
-        Ok(assemble_features(detection, descriptors))
+        self.describe_u8(config, &detection, &mut scratch)
+    }
+
+    /// Queue the image upload and return the source buffer and whether it
+    /// holds packed bytes.
+    ///
+    /// Decoded 8-bit images hold exact integers in [0, 255]. Those are sent as
+    /// bytes packed four per word, a quarter of the f32 upload; the init
+    /// shader widens them back to the same f32 values. Any other image is sent
+    /// unchanged.
+    fn upload_image(
+        &self,
+        image: &GrayImage,
+        scratch: &mut Scratch,
+    ) -> Result<(wgpu::Buffer, bool), RunError> {
+        let pixels = image.as_slice();
+        let packed_bytes = pixels
+            .len()
+            .div_ceil(4)
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(RunError::Capacity { what: "input" })?;
+        self.ensure_storage_capacity(packed_bytes)?;
+        let source = scratch
+            .source
+            .ensure_storage(&self.device, "omvg-sift-input", packed_bytes);
+        scratch.packed_input.resize(pixels.len().div_ceil(4), 0);
+        if pack_u8_image(pixels, &mut scratch.packed_input) {
+            self.queue
+                .write_buffer(&source, 0, bytemuck::cast_slice(&scratch.packed_input));
+            return Ok((source, true));
+        }
+        // Not an 8-bit image: send the f32 values unchanged.
+        let float_bytes = pixels
+            .len()
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or(RunError::Capacity { what: "input" })?;
+        self.ensure_storage_capacity(float_bytes)?;
+        let source = scratch
+            .source
+            .ensure_storage(&self.device, "omvg-sift-input", float_bytes);
+        self.queue
+            .write_buffer(&source, 0, bytemuck::cast_slice(pixels));
+        Ok((source, false))
     }
 
     fn detect_features(
@@ -800,55 +889,51 @@ impl Engine {
             capacities.push(capacity);
         }
 
-        let source_bytes = height
-            .checked_mul(width)
-            .and_then(|pixels| pixels.checked_mul(core::mem::size_of::<f32>()))
-            .ok_or(RunError::Capacity { what: "input" })?;
-        self.ensure_storage_capacity(source_bytes)?;
-        let source = scratch
-            .source
-            .ensure_storage(&self.device, "omvg-sift-input", source_bytes);
-        self.queue
-            .write_buffer(&source, 0, bytemuck::cast_slice(image.as_slice()));
+        let (source, packed) = self.upload_image(image, scratch)?;
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("omvg-sift-scale-space"),
-            });
-        let mut keep_buffers: Vec<wgpu::Buffer> = Vec::new();
-        let mut keep_bind_groups: Vec<wgpu::BindGroup> = Vec::new();
+        let mut encoder = Recorder::new(&self.device, "omvg-sift-scale-space");
+        scratch.params.reset();
 
         // Initial level of the first octave.
         self.encode_init(
             &mut encoder,
+            &mut scratch.params,
             &source,
             &temp_as[0],
-            height,
-            width,
-            base_rows,
-            base_cols,
-            first_octave == -1,
-            &mut keep_buffers,
-            &mut keep_bind_groups,
+            InitParams {
+                src_rows_cols: [height as u32, width as u32],
+                dst_rows_cols: [base_rows as u32, base_cols as u32],
+                src_off: 0,
+                dst_off: 0,
+                upscale: u32::from(first_octave == -1),
+                packed: u32::from(packed),
+            },
         );
         if sigma_extra > 0.01 {
+            let weights = cached_gaussian_weights(
+                &self.device,
+                &self.queue,
+                &mut scratch.blur_weights,
+                sigma_extra,
+            );
             self.encode_blur_pair(
                 &mut encoder,
-                scratch,
-                &temp_as[0],
-                &temp_bs[0],
-                &octaves[0].gauss,
-                0,
-                base_rows,
-                base_cols,
-                0,
-                sigma_extra,
-                &mut keep_buffers,
-                &mut keep_bind_groups,
+                &mut scratch.params,
+                &weights,
+                BlurPair {
+                    source: &temp_as[0],
+                    temp: &temp_bs[0],
+                    destination: &octaves[0].gauss,
+                    dog: &dog_buffers[0],
+                    rows: base_rows,
+                    cols: base_cols,
+                    source_offset: 0,
+                    destination_offset: 0,
+                    dog_offset: None,
+                },
             );
         } else {
-            encoder.copy_buffer_to_buffer(
+            encoder.encoder().copy_buffer_to_buffer(
                 &temp_as[0],
                 0,
                 &octaves[0].gauss,
@@ -857,25 +942,28 @@ impl Engine {
             );
         }
 
-        // Remaining Gaussian levels of every octave.
+        // Remaining Gaussian levels of every octave. The second blur pass of
+        // level `l` also writes DoG plane `l - 1` = level `l` - level `l - 1`,
+        // the same f32 subtraction as `compute_dogs`.
         for octave in 0..num_octaves {
             let rows = octaves[octave].rows;
             let cols = octaves[octave].cols;
             let plane = rows * cols;
             if octave > 0 {
                 let previous = &octaves[octave - 1];
-                let source_offset = config.num_scales * previous.rows * previous.cols;
                 self.encode_decimate(
                     &mut encoder,
+                    &mut scratch.params,
                     &previous.gauss,
                     &octaves[octave].gauss,
-                    previous.rows,
-                    previous.cols,
-                    rows,
-                    cols,
-                    source_offset,
-                    &mut keep_buffers,
-                    &mut keep_bind_groups,
+                    DecimateParams {
+                        src_rows_cols: [previous.rows as u32, previous.cols as u32],
+                        dst_rows_cols: [rows as u32, cols as u32],
+                        src_off: (config.num_scales * previous.rows * previous.cols) as u32,
+                        dst_off: 0,
+                        pad0: 0,
+                        pad1: 0,
+                    },
                 );
             }
             for level in 1..levels {
@@ -889,97 +977,111 @@ impl Engine {
                     (((sigma_next * sigma_next - sigma_previous * sigma_previous).max(0.0)).sqrt()
                         / octaves[octave].delta)
                         .max(0.01);
+                let weights = cached_gaussian_weights(
+                    &self.device,
+                    &self.queue,
+                    &mut scratch.blur_weights,
+                    extra,
+                );
                 self.encode_blur_pair(
                     &mut encoder,
-                    scratch,
-                    &octaves[octave].gauss,
-                    &temp_as[octave],
-                    &octaves[octave].gauss,
-                    (level - 1) * plane,
-                    rows,
-                    cols,
-                    level * plane,
-                    extra,
-                    &mut keep_buffers,
-                    &mut keep_bind_groups,
-                );
-            }
-        }
-
-        // DoG planes.
-        for octave in 0..num_octaves {
-            let rows = octaves[octave].rows;
-            let cols = octaves[octave].cols;
-            let plane = rows * cols;
-            for level in 0..dogs {
-                self.encode_dog(
-                    &mut encoder,
-                    &octaves[octave].gauss,
-                    &dog_buffers[octave],
-                    rows,
-                    cols,
-                    level * plane,
-                    (level + 1) * plane,
-                    level * plane,
-                    &mut keep_buffers,
-                    &mut keep_bind_groups,
+                    &mut scratch.params,
+                    &weights,
+                    BlurPair {
+                        source: &octaves[octave].gauss,
+                        temp: &temp_as[octave],
+                        destination: &octaves[octave].gauss,
+                        dog: &dog_buffers[octave],
+                        rows,
+                        cols,
+                        source_offset: (level - 1) * plane,
+                        destination_offset: level * plane,
+                        dog_offset: Some((level - 1) * plane),
+                    },
                 );
             }
         }
 
         // Clear detector counters, then run extrema and refinement per octave.
         for count in &candidate_counts {
-            encoder.clear_buffer(count, 0, None);
+            encoder.encoder().clear_buffer(count, 0, None);
         }
         for count in &refined_counts {
-            encoder.clear_buffer(count, 0, None);
+            encoder.encoder().clear_buffer(count, 0, None);
         }
         for octave in 0..num_octaves {
             let rows = octaves[octave].rows;
             let cols = octaves[octave].cols;
-            self.encode_extrema(
+            let bind_group = self.bind(
+                &mut scratch.params,
+                &self.layouts.extrema,
+                &ExtremaParams {
+                    rows_cols: [rows as u32, cols as u32],
+                    levels: levels as u32,
+                    threshold: config.peak_threshold / config.num_scales as f32 * 0.8,
+                    octave: octave as u32,
+                    cap: capacities[octave] as u32,
+                    pad0: 0,
+                    pad1: 0,
+                },
+                &[
+                    &dog_buffers[octave],
+                    &candidate_buffers[octave],
+                    &candidate_counts[octave],
+                ],
+            );
+            self.dispatch(
                 &mut encoder,
-                &dog_buffers[octave],
-                &candidate_buffers[octave],
-                &candidate_counts[octave],
-                rows,
-                cols,
-                levels,
-                config.peak_threshold / config.num_scales as f32 * 0.8,
-                octave,
-                capacities[octave],
-                &mut keep_buffers,
-                &mut keep_bind_groups,
+                "omvg-sift-extrema",
+                &self.pipelines.extrema,
+                &bind_group,
+                [
+                    (rows as u32).div_ceil(8),
+                    (cols as u32).div_ceil(8),
+                    levels.saturating_sub(3).max(1) as u32,
+                ],
             );
         }
         for octave in 0..num_octaves {
             let rows = octaves[octave].rows;
             let cols = octaves[octave].cols;
-            self.encode_refine(
+            let refine_workgroups =
+                REFINE_WORKGROUPS.min(capacities[octave].div_ceil(64).max(1) as u32);
+            let bind_group = self.bind(
+                &mut scratch.params,
+                &self.layouts.refine,
+                &RefineParams {
+                    rows_cols: [rows as u32, cols as u32],
+                    levels: levels as u32,
+                    num_scales: config.num_scales as u32,
+                    delta: octaves[octave].delta,
+                    sigma_min,
+                    delta_min,
+                    edge_threshold: config.edge_threshold,
+                    peak_threshold: config.peak_threshold / config.num_scales as f32,
+                    cap: capacities[octave] as u32,
+                    octave: octave as u32,
+                    grid_workgroups: refine_workgroups,
+                    pad1: [0; 4],
+                },
+                &[
+                    &dog_buffers[octave],
+                    &candidate_buffers[octave],
+                    &candidate_counts[octave],
+                    &refined_buffers[octave],
+                    &refined_counts[octave],
+                ],
+            );
+            self.dispatch(
                 &mut encoder,
-                &dog_buffers[octave],
-                &candidate_buffers[octave],
-                &candidate_counts[octave],
-                &refined_buffers[octave],
-                &refined_counts[octave],
-                rows,
-                cols,
-                levels,
-                config.num_scales,
-                octaves[octave].delta,
-                sigma_min,
-                delta_min,
-                config.edge_threshold,
-                config.peak_threshold / config.num_scales as f32,
-                octave,
-                capacities[octave],
-                &mut keep_buffers,
-                &mut keep_bind_groups,
+                "omvg-sift-refine",
+                &self.pipelines.refine,
+                &bind_group,
+                [refine_workgroups, 1, 1],
             );
         }
+        scratch.params.flush(&self.queue);
         self.queue.submit(Some(encoder.finish()));
-        drop(keep_bind_groups);
-        drop(keep_buffers);
 
         let mut count_ranges = Vec::with_capacity(num_octaves * 2);
         for octave in 0..num_octaves {
@@ -1002,208 +1104,87 @@ impl Engine {
             refined_totals.push(refined_count);
         }
 
-        let mut refined_ranges = Vec::with_capacity(num_octaves);
-        for octave in 0..num_octaves {
-            refined_ranges.push((
+        // Order, deduplicate and orient every octave on the GPU, then read the
+        // surviving features with their orientation counts and first peaks in
+        // one transfer. Most keypoints have a single dominant orientation, so
+        // the prefix covers the common case without touching the fixed-stride
+        // planes; images with more peaks fall back to the full planes below.
+        // Orientation keeps the CPU's octave and bin order; the host applies
+        // the feature budget after all octaves.
+        let mut encoder = Recorder::new(&self.device, "omvg-sift-orientation");
+        let mut orders = Vec::with_capacity(num_octaves);
+        for (octave, octave_data) in octaves.iter().enumerate() {
+            let n = refined_totals[octave];
+            if n == 0 {
+                continue;
+            }
+            let order = self.encode_order(
+                &mut encoder,
+                scratch,
+                octave,
+                octave_data,
+                config.num_scales,
+                n,
                 &refined_buffers[octave],
-                refined_totals[octave] * REFINED_BYTES,
+            )?;
+            orders.push(order);
+        }
+        scratch.params.flush(&self.queue);
+        self.queue.submit(Some(encoder.finish()));
+
+        let mut ranges = Vec::with_capacity(orders.len() * 4);
+        for order in &orders {
+            ranges.push((&order.work, core::mem::size_of::<u32>()));
+            ranges.push((&order.features, order.capacity * ORDERED_FEATURE_BYTES));
+            ranges.push((&order.counts, order.capacity * core::mem::size_of::<u32>()));
+            ranges.push((
+                &order.prefix,
+                order.capacity * ORIENTATION_PREFIX * core::mem::size_of::<f32>(),
             ));
         }
-        let (refined_data, refined_offsets) = read_buffers(
-            &self.device,
-            &self.queue,
-            &mut scratch.staging,
-            &refined_ranges,
-        )?;
+        let (prefix_data, offsets) =
+            read_buffers(&self.device, &self.queue, &mut scratch.staging, &ranges)?;
         let mut refined = Vec::new();
-        for octave in 0..num_octaves {
-            let refined_count = refined_totals[octave];
-            let start = refined_offsets[octave];
-            let bytes = &refined_data[start..start + refined_count * REFINED_BYTES];
-            let mut records = Vec::with_capacity(refined_count);
-            for chunk in bytes.as_chunks::<REFINED_BYTES>().0 {
-                records.push(bytemuck::pod_read_unaligned::<GpuRefined>(chunk));
+        let mut orientation_readbacks = Vec::with_capacity(orders.len());
+        let mut prefix_offsets = Vec::with_capacity(orders.len() * 2);
+        for (order, offsets) in orders.into_iter().zip(offsets.as_chunks::<4>().0) {
+            let kept = read_u32(&prefix_data, offsets[0]) as usize;
+            if kept > order.capacity {
+                return Err(RunError::Capacity {
+                    what: "refined keypoint",
+                });
             }
-            records
-                .sort_unstable_by_key(|record| (record.orig_level, record.orig_j, record.orig_i));
-            let mut seen = BTreeSet::new();
-            for record in records {
-                if !seen.insert((record.level, record.j, record.i)) {
-                    continue;
-                }
-                if record.accepted == 0 {
-                    continue;
-                }
+            let first = refined.len();
+            for record in prefix_data[offsets[1]..offsets[1] + kept * ORDERED_FEATURE_BYTES]
+                .as_chunks::<ORDERED_FEATURE_BYTES>()
+                .0
+            {
+                let record = bytemuck::pod_read_unaligned::<GpuFeature>(record);
                 refined.push(Feature {
                     x: record.x,
                     y: record.y,
                     sigma: record.sigma,
                     orientation: 0.0,
-                    peak: record.value,
-                    octave: record.octave as usize,
+                    peak: record.peak,
+                    octave: order.octave,
                     scale_index: record.level as usize,
                 });
             }
-        }
-
-        // Orientation is computed per octave, preserving the CPU's octave and
-        // bin order. The host applies the feature budget after all octaves.
-        let mut orientation_readbacks = Vec::new();
-        for (octave, octave_data) in octaves.iter().enumerate() {
-            let mut keys = Vec::new();
-            let mut indices = Vec::new();
-            for (index, feature) in refined.iter().enumerate() {
-                if feature.octave == octave {
-                    keys.push(GpuOriKey {
-                        x: feature.x / octave_data.delta,
-                        y: feature.y / octave_data.delta,
-                        sigma: feature.sigma / octave_data.delta,
-                        level: feature.scale_index as u32,
-                    });
-                    indices.push(index);
-                }
-            }
-            if keys.is_empty() {
+            if kept == 0 {
                 continue;
             }
-            let key_count = keys.len();
-            let key_bytes = key_count
-                .checked_mul(core::mem::size_of::<GpuOriKey>())
-                .ok_or(RunError::Capacity {
-                    what: "orientation keys",
-                })?;
-            let count_bytes =
-                key_count
-                    .checked_mul(core::mem::size_of::<u32>())
-                    .ok_or(RunError::Capacity {
-                        what: "orientation counts",
-                    })?;
-            let orientation_bytes = key_count
-                .checked_mul(MAX_ORIENTATIONS)
-                .and_then(|count| count.checked_mul(core::mem::size_of::<f32>()))
-                .ok_or(RunError::Capacity {
-                    what: "orientations",
-                })?;
-            let prefix_bytes = key_count
-                .checked_mul(ORIENTATION_PREFIX)
-                .and_then(|count| count.checked_mul(core::mem::size_of::<f32>()))
-                .ok_or(RunError::Capacity {
-                    what: "orientation prefix",
-                })?;
-            self.ensure_storage_capacity(key_bytes)?;
-            self.ensure_storage_capacity(count_bytes)?;
-            self.ensure_storage_capacity(orientation_bytes)?;
-            self.ensure_storage_capacity(prefix_bytes)?;
-            let key_buffer = scratch.orientation_keys[octave].ensure_storage(
-                &self.device,
-                "omvg-sift-orientation-keys",
-                key_bytes,
-            );
-            self.queue
-                .write_buffer(&key_buffer, 0, bytemuck::cast_slice(&keys));
-            let counts = scratch.orientation_counts[octave].ensure_storage(
-                &self.device,
-                "omvg-sift-orientation-counts",
-                count_bytes,
-            );
-            let orientations = scratch.orientations[octave].ensure_storage(
-                &self.device,
-                "omvg-sift-orientations",
-                orientation_bytes,
-            );
-            let prefix = scratch.orientation_prefix[octave].ensure_storage(
-                &self.device,
-                "omvg-sift-orientation-prefix",
-                prefix_bytes,
-            );
-            let uniform = uniform_buffer(
-                &self.device,
-                &self.queue,
-                "omvg-sift-orientation-params",
-                &OriParams {
-                    rows_cols: [octave_data.rows as u32, octave_data.cols as u32],
-                    level: 0,
-                    key_count: key_count as u32,
-                    gauss_off: 0,
-                    pad0: 0,
-                    pad1: 0,
-                    pad2: 0,
-                },
-            );
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("omvg-sift-orientation"),
-                layout: &self.layouts.orientation,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: octave_data.gauss.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: key_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: counts.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: orientations.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: prefix.as_entire_binding(),
-                    },
-                ],
-            });
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("omvg-sift-orientation"),
-                });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("omvg-sift-orientation"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipelines.orientation);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(key_count.div_ceil(32).max(1) as u32, 1, 1);
-            }
-            self.queue.submit(Some(encoder.finish()));
+            prefix_offsets.push(offsets[2]);
+            prefix_offsets.push(offsets[3]);
             orientation_readbacks.push(OrientationReadback {
-                octave,
-                key_count,
-                count_bytes,
-                orientation_bytes,
-                prefix_bytes,
-                keys: key_buffer,
-                counts,
-                orientations,
-                prefix,
-                indices,
+                octave: order.octave,
+                key_count: kept,
+                orientation_bytes: kept * MAX_ORIENTATIONS * core::mem::size_of::<f32>(),
+                keys: order.keys,
+                counts: order.counts,
+                orientations: order.orientations,
+                indices: (first..first + kept).collect(),
             });
         }
-
-        // Read the per-keypoint counts and the first few orientation peaks in
-        // one transfer. Most keypoints have a single dominant orientation, so
-        // the prefix covers the common case without touching the fixed-stride
-        // planes. Images with more peaks fall back to the full planes below.
-        let mut orientation_ranges = Vec::with_capacity(orientation_readbacks.len() * 2);
-        for readback in &orientation_readbacks {
-            orientation_ranges.push((&readback.counts, readback.count_bytes));
-            orientation_ranges.push((&readback.prefix, readback.prefix_bytes));
-        }
-        let (prefix_data, prefix_offsets) = read_buffers(
-            &self.device,
-            &self.queue,
-            &mut scratch.staging,
-            &orientation_ranges,
-        )?;
         let mut compactions = Vec::with_capacity(orientation_readbacks.len());
         let mut needs_full_orientations = false;
         for (index, readback) in orientation_readbacks.iter().enumerate() {
@@ -1255,70 +1236,35 @@ impl Engine {
         }
 
         if !compactions.is_empty() {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("omvg-sift-orientation-compact"),
-                });
-            let mut keep_buffers: Vec<wgpu::Buffer> = Vec::new();
-            let mut keep_bind_groups: Vec<wgpu::BindGroup> = Vec::new();
+            let mut encoder = Recorder::new(&self.device, "omvg-sift-orientation-compact");
             for (readback, compaction) in orientation_readbacks.iter().zip(&compactions) {
-                let uniform = uniform_buffer(
-                    &self.device,
-                    &self.queue,
-                    "omvg-sift-compact-params",
+                let bind_group = self.bind(
+                    &mut scratch.params,
+                    &self.layouts.compact,
                     &CompactParams {
                         key_count: readback.key_count as u32,
                         max_orientations: MAX_ORIENTATIONS as u32,
                         pad0: 0,
                         pad1: 0,
                     },
-                );
-                keep_buffers.push(uniform.clone());
-                keep_bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("omvg-sift-compact"),
-                    layout: &self.layouts.compact,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: uniform.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: readback.counts.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: compaction.offset_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: readback.orientations.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: readback.keys.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: compaction.compact_keys.as_entire_binding(),
-                        },
+                    &[
+                        &readback.counts,
+                        &compaction.offset_buffer,
+                        &readback.orientations,
+                        &readback.keys,
+                        &compaction.compact_keys,
                     ],
-                }));
-                let bind_group = keep_bind_groups.last().ok_or(RunError::Capacity {
-                    what: "compact bind group",
-                })?;
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("omvg-sift-compact"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipelines.compact);
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.dispatch_workgroups(readback.key_count.div_ceil(64).max(1) as u32, 1, 1);
+                );
+                self.dispatch(
+                    &mut encoder,
+                    "omvg-sift-compact",
+                    &self.pipelines.compact,
+                    &bind_group,
+                    [readback.key_count.div_ceil(64).max(1) as u32, 1, 1],
+                );
             }
+            scratch.params.flush(&self.queue);
             self.queue.submit(Some(encoder.finish()));
-            drop(keep_bind_groups);
-            drop(keep_buffers);
         }
 
         let mut oriented = Vec::new();
@@ -1414,16 +1360,28 @@ impl Engine {
         config: &SiftExtractor,
         detection: &Detection,
         scratch: &mut Scratch,
-    ) -> Result<Vec<Option<D>>, RunError> {
+    ) -> Result<ScaleSpaceFeatures<D>, RunError> {
         let readbacks =
             self.encode_descriptor_readbacks(config, detection, scratch, DescriptorFormat::F32)?;
-        let (data, offsets) = self.read_descriptor_buffers(scratch, &readbacks)?;
-        Ok(decode_f32_descriptors::<D>(
-            &data,
-            &readbacks,
-            &offsets,
-            detection.features.len(),
-        ))
+        self.read_descriptor_buffers(scratch, &readbacks, |data, offsets| {
+            assemble_features(
+                detection,
+                &readbacks,
+                offsets,
+                |local, offset| {
+                    let base = offset + local * SIFT_DESCR_SIZE * 4;
+                    let mut values = [0.0f32; SIFT_DESCR_SIZE];
+                    for (value, bytes) in values
+                        .iter_mut()
+                        .zip(data[base..base + SIFT_DESCR_SIZE * 4].as_chunks::<4>().0)
+                    {
+                        *value = f32::from_le_bytes(*bytes);
+                    }
+                    D::try_from_finalized(&values).ok()
+                },
+                data,
+            )
+        })
     }
 
     fn describe_u8(
@@ -1431,16 +1389,25 @@ impl Engine {
         config: &SiftExtractor,
         detection: &Detection,
         scratch: &mut Scratch,
-    ) -> Result<Vec<Option<U8Descriptor>>, RunError> {
+    ) -> Result<ScaleSpaceFeatures<U8Descriptor>, RunError> {
         let readbacks =
             self.encode_descriptor_readbacks(config, detection, scratch, DescriptorFormat::U8)?;
-        let (data, offsets) = self.read_descriptor_buffers(scratch, &readbacks)?;
-        Ok(decode_u8_descriptors(
-            &data,
-            &readbacks,
-            &offsets,
-            detection.features.len(),
-        ))
+        self.read_descriptor_buffers(scratch, &readbacks, |data, offsets| {
+            assemble_features(
+                detection,
+                &readbacks,
+                offsets,
+                |local, offset| {
+                    // The shader packs byte `4w + l` into lane `l` of word `w`,
+                    // so the little-endian words are the descriptor bytes in order.
+                    let base = offset + local * SIFT_DESCR_SIZE;
+                    let bytes: [u8; SIFT_DESCR_SIZE] =
+                        data[base..base + SIFT_DESCR_SIZE].try_into().ok()?;
+                    U8Descriptor::try_new(bytes, 255.0).ok()
+                },
+                data,
+            )
+        })
     }
 
     fn encode_descriptor_readbacks(
@@ -1451,6 +1418,7 @@ impl Engine {
         format: DescriptorFormat,
     ) -> Result<Vec<DescriptorReadback>, RunError> {
         let mut descriptor_readbacks = Vec::new();
+        let mut encoder = Recorder::new(&self.device, "omvg-sift-descriptor");
         for (octave_index, octave) in detection.octaves.iter().enumerate() {
             let compact_key = detection.compact_keys.as_ref().and_then(|compact| {
                 compact.keys[octave_index]
@@ -1530,10 +1498,9 @@ impl Engine {
                 "omvg-sift-descriptor-valid",
                 valid_bytes,
             );
-            let uniform = uniform_buffer(
-                &self.device,
-                &self.queue,
-                "omvg-sift-descriptor-params",
+            let bind_group = self.bind(
+                &mut scratch.params,
+                &self.layouts.describe,
                 &DescParams {
                     rows_cols: [octave.rows as u32, octave.cols as u32],
                     level: 0,
@@ -1543,48 +1510,15 @@ impl Engine {
                     gauss_off: 0,
                     quantize_u8: format.quantize_u8(),
                 },
+                &[&octave.gauss, &key_buffer, &values, &valid],
             );
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("omvg-sift-descriptor"),
-                layout: &self.layouts.describe,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: octave.gauss.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: key_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: values.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: valid.as_entire_binding(),
-                    },
-                ],
-            });
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("omvg-sift-descriptor"),
-                });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("omvg-sift-descriptor"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipelines.describe);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(key_count as u32, 1, 1);
-            }
-            self.queue.submit(Some(encoder.finish()));
+            self.dispatch(
+                &mut encoder,
+                "omvg-sift-descriptor",
+                &self.pipelines.describe,
+                &bind_group,
+                workgroup_grid(key_count),
+            );
             descriptor_readbacks.push(DescriptorReadback {
                 key_count,
                 valid_bytes,
@@ -1594,464 +1528,590 @@ impl Engine {
                 feature_indices,
             });
         }
+        scratch.params.flush(&self.queue);
+        self.queue.submit(Some(encoder.finish()));
         Ok(descriptor_readbacks)
     }
 
-    fn read_descriptor_buffers(
+    fn read_descriptor_buffers<R>(
         &self,
         scratch: &mut Scratch,
         readbacks: &[DescriptorReadback],
-    ) -> Result<(Vec<u8>, Vec<usize>), RunError> {
+        decode: impl FnOnce(&[u8], &[usize]) -> R,
+    ) -> Result<R, RunError> {
         let mut ranges = Vec::with_capacity(readbacks.len() * 2);
         for readback in readbacks {
             ranges.push((&readback.valid, readback.valid_bytes));
             ranges.push((&readback.values, readback.value_bytes));
         }
-        read_buffers(&self.device, &self.queue, &mut scratch.staging, &ranges)
+        read_buffers_with(
+            &self.device,
+            &self.queue,
+            &mut scratch.staging,
+            &ranges,
+            decode,
+        )
     }
 
+    /// Encode the GPU ordering, deduplication and orientation of one
+    /// octave's `n` refined samples (see `order.wgsl`).
     #[allow(clippy::too_many_arguments)]
+    fn encode_order(
+        &self,
+        encoder: &mut Recorder,
+        scratch: &mut Scratch,
+        octave: usize,
+        octave_data: &Octave,
+        num_scales: usize,
+        n: usize,
+        refined: &wgpu::Buffer,
+    ) -> Result<OrderedOctave, RunError> {
+        let capacity_error = RunError::Capacity {
+            what: "refined keypoint",
+        };
+        let (rows, cols) = (octave_data.rows, octave_data.cols);
+        // Refined sample indices must fit u32 for every DoG level.
+        if (num_scales + 3)
+            .checked_mul(rows * cols)
+            .is_none_or(|samples| samples >= u32::MAX as usize)
+        {
+            return Err(capacity_error);
+        }
+        let buckets = num_scales * rows;
+        let hash_slots = (2 * n).next_power_of_two();
+        let mut offset = 1usize;
+        let mut region = |len: usize| {
+            let start = offset;
+            offset += len;
+            start as u32
+        };
+        let off_count = region(buckets);
+        let off_start = region(buckets);
+        let off_cursor = region(buckets);
+        let off_sorted = region(n);
+        let off_hash_keys = region(hash_slots);
+        let off_hash_vals = region(hash_slots);
+        let off_slot = region(n);
+        let off_kept = region(n);
+        let off_pos = region(n);
+        let work_bytes =
+            offset
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(RunError::Capacity {
+                    what: "refined keypoint",
+                })?;
+        if offset > u32::MAX as usize {
+            return Err(RunError::Capacity {
+                what: "refined keypoint",
+            });
+        }
+        let feature_bytes = n * ORDERED_FEATURE_BYTES;
+        let key_bytes = n * core::mem::size_of::<GpuOriKey>();
+        let count_bytes = n * core::mem::size_of::<u32>();
+        let orientation_bytes = n * MAX_ORIENTATIONS * core::mem::size_of::<f32>();
+        let prefix_bytes = n * ORIENTATION_PREFIX * core::mem::size_of::<f32>();
+        for bytes in [
+            work_bytes,
+            feature_bytes,
+            key_bytes,
+            count_bytes,
+            orientation_bytes,
+            prefix_bytes,
+        ] {
+            self.ensure_storage_capacity(bytes)?;
+        }
+        let device = &self.device;
+        let work = scratch.order_work[octave].ensure_storage(device, "omvg-sift-order", work_bytes);
+        let features = scratch.ordered_features[octave].ensure_storage(
+            device,
+            "omvg-sift-ordered",
+            feature_bytes,
+        );
+        let keys = scratch.orientation_keys[octave].ensure_storage(
+            device,
+            "omvg-sift-orientation-keys",
+            key_bytes,
+        );
+        let counts = scratch.orientation_counts[octave].ensure_storage(
+            device,
+            "omvg-sift-orientation-counts",
+            count_bytes,
+        );
+        let orientations = scratch.orientations[octave].ensure_storage(
+            device,
+            "omvg-sift-orientations",
+            orientation_bytes,
+        );
+        let prefix = scratch.orientation_prefix[octave].ensure_storage(
+            device,
+            "omvg-sift-orientation-prefix",
+            prefix_bytes,
+        );
+
+        encoder
+            .encoder()
+            .clear_buffer(&work, 0, Some(work_bytes as u64));
+        let base = OrderParams {
+            n: n as u32,
+            rows: rows as u32,
+            cols: cols as u32,
+            buckets: buckets as u32,
+            pad0: 0,
+            hash_mask: (hash_slots - 1) as u32,
+            inv_delta: 1.0 / octave_data.delta,
+            scan_len: 0,
+            scan_src: 0,
+            scan_dst: 0,
+            scan_copy: ORDER_NO_COPY,
+            off_count,
+            off_start,
+            off_cursor,
+            off_sorted,
+            off_hash_keys,
+            off_hash_vals,
+            off_slot,
+            off_kept,
+            off_pos,
+        };
+        let bucket_scan = OrderParams {
+            scan_len: buckets as u32,
+            scan_src: off_count,
+            scan_dst: off_start,
+            scan_copy: off_cursor,
+            ..base
+        };
+        let kept_scan = OrderParams {
+            scan_len: n as u32,
+            scan_src: off_kept,
+            scan_dst: off_pos,
+            scan_copy: ORDER_NO_COPY,
+            ..base
+        };
+        let storage = [refined, &work, &features, &keys];
+        let items = item_grid(n);
+        let steps: [(&'static str, &wgpu::ComputePipeline, &OrderParams, [u32; 3]); 8] = [
+            (
+                "omvg-sift-order-hist",
+                &self.pipelines.order_hist,
+                &base,
+                items,
+            ),
+            (
+                "omvg-sift-order-scan",
+                &self.pipelines.order_scan,
+                &bucket_scan,
+                [1, 1, 1],
+            ),
+            (
+                "omvg-sift-order-scatter",
+                &self.pipelines.order_scatter,
+                &base,
+                items,
+            ),
+            (
+                "omvg-sift-order-bucket-sort",
+                &self.pipelines.order_bucket_sort,
+                &base,
+                item_grid(buckets),
+            ),
+            (
+                "omvg-sift-order-hash",
+                &self.pipelines.order_hash,
+                &base,
+                items,
+            ),
+            (
+                "omvg-sift-order-flag",
+                &self.pipelines.order_flag,
+                &base,
+                items,
+            ),
+            (
+                "omvg-sift-order-scan",
+                &self.pipelines.order_scan,
+                &kept_scan,
+                [1, 1, 1],
+            ),
+            (
+                "omvg-sift-order-emit",
+                &self.pipelines.order_emit,
+                &base,
+                items,
+            ),
+        ];
+        for (label, pipeline, params, workgroups) in steps {
+            let bind_group = self.bind(&mut scratch.params, &self.layouts.order, params, &storage);
+            self.dispatch(encoder, label, pipeline, &bind_group, workgroups);
+        }
+
+        let bind_group = self.bind(
+            &mut scratch.params,
+            &self.layouts.orientation,
+            &OriParams {
+                rows_cols: [rows as u32, cols as u32],
+                level: 0,
+                key_count: n as u32,
+                gauss_off: 0,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+            },
+            &[
+                &octave_data.gauss,
+                &keys,
+                &counts,
+                &orientations,
+                &prefix,
+                &work,
+            ],
+        );
+        self.dispatch(
+            encoder,
+            "omvg-sift-orientation",
+            &self.pipelines.orientation,
+            &bind_group,
+            workgroup_grid(n),
+        );
+        Ok(OrderedOctave {
+            octave,
+            capacity: n,
+            work,
+            features,
+            keys,
+            counts,
+            orientations,
+            prefix,
+        })
+    }
+
+    /// Create a bind group whose binding 0 is `value` in the parameter arena
+    /// and whose bindings `1..` are `buffers`, in order.
+    fn bind<T: bytemuck::Pod>(
+        &self,
+        params: &mut ParamArena,
+        layout: &wgpu::BindGroupLayout,
+        value: &T,
+        buffers: &[&wgpu::Buffer],
+    ) -> wgpu::BindGroup {
+        let (buffer, offset) = params.push(&self.device, value);
+        let mut entries = Vec::with_capacity(buffers.len() + 1);
+        entries.push(wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &buffer,
+                offset,
+                size: wgpu::BufferSize::new(PARAM_SLOT_BYTES),
+            }),
+        });
+        for (index, storage) in buffers.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: index as u32 + 1,
+                resource: storage.as_entire_binding(),
+            });
+        }
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout,
+            entries: &entries,
+        })
+    }
+
+    /// Record one dispatch. Consecutive dispatches share one compute pass,
+    /// which wgpu splits with the barriers the data dependencies need; a pass
+    /// per dispatch would make `CommandEncoder::finish` far more expensive.
+    fn dispatch(
+        &self,
+        recorder: &mut Recorder,
+        label: &'static str,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        workgroups: [u32; 3],
+    ) {
+        let pass = recorder.pass.get_or_insert_with(|| {
+            recorder
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(label),
+                    timestamp_writes: None,
+                })
+                .forget_lifetime()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+    }
+
     fn encode_init(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut Recorder,
+        params: &mut ParamArena,
         source: &wgpu::Buffer,
         destination: &wgpu::Buffer,
-        source_rows: usize,
-        source_cols: usize,
-        destination_rows: usize,
-        destination_cols: usize,
-        upscale: bool,
-        keep_buffers: &mut Vec<wgpu::Buffer>,
-        keep_bind_groups: &mut Vec<wgpu::BindGroup>,
+        init: InitParams,
     ) {
-        let uniform = uniform_buffer(
-            &self.device,
-            &self.queue,
+        let bind_group = self.bind(params, &self.layouts.init, &init, &[source, destination]);
+        self.dispatch(
+            encoder,
             "omvg-sift-init",
-            &InitParams {
-                src_rows_cols: [source_rows as u32, source_cols as u32],
-                dst_rows_cols: [destination_rows as u32, destination_cols as u32],
-                src_off: 0,
-                dst_off: 0,
-                upscale: u32::from(upscale),
-                pad: 0,
-            },
-        );
-        keep_buffers.push(uniform.clone());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("omvg-sift-init"),
-            layout: &self.layouts.init,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: source.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: destination.as_entire_binding(),
-                },
+            &self.pipelines.init,
+            &bind_group,
+            [
+                init.dst_rows_cols[0].div_ceil(16),
+                init.dst_rows_cols[1].div_ceil(16),
+                1,
             ],
-        });
-        keep_bind_groups.push(bind_group);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("omvg-sift-init"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipelines.init);
-        pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
-        pass.dispatch_workgroups(
-            (destination_rows as u32).div_ceil(16),
-            (destination_cols as u32).div_ceil(16),
-            1,
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Separable blur of one plane. Kernels up to `FUSED_BLUR_MAX_RADIUS`
+    /// run both passes in one tiled dispatch (`blur_fused.wgsl`); larger ones
+    /// run two passes: `source` into `temp` along rows, then `temp` into
+    /// `destination` across columns. The destination may be the
+    /// same buffer as `source` at another plane; the passes are ordered. With
+    /// `dog_offset`, the second pass also writes the DoG plane (this level
+    /// minus the source level) into `dog`.
     fn encode_blur_pair(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
-        scratch: &mut Scratch,
-        source: &wgpu::Buffer,
-        temp_a: &wgpu::Buffer,
-        destination: &wgpu::Buffer,
-        source_offset: usize,
-        rows: usize,
-        cols: usize,
-        destination_offset: usize,
-        sigma: f32,
-        keep_buffers: &mut Vec<wgpu::Buffer>,
-        keep_bind_groups: &mut Vec<wgpu::BindGroup>,
+        encoder: &mut Recorder,
+        params: &mut ParamArena,
+        weights: &(wgpu::Buffer, usize),
+        pair: BlurPair<'_>,
     ) {
-        let kernel = gaussian_weights(sigma);
-        let radius = kernel.len().saturating_sub(1);
-        let weight_buffer =
-            cached_gaussian_weights(&self.device, &self.queue, scratch, sigma, &kernel);
-
-        self.encode_blur(
-            encoder,
-            source,
-            temp_a,
-            &weight_buffer,
-            rows,
-            cols,
-            source_offset,
-            0,
-            radius,
-            true,
-            keep_buffers,
-            keep_bind_groups,
-        );
-        // The first pass reads `source`; the second writes `destination`
-        // directly. The destination may be the same buffer as `source` at a
-        // different plane offset, but the dispatches are ordered and the
-        // intermediate lives in `temp_a`.
-        self.encode_blur(
-            encoder,
-            temp_a,
-            destination,
-            &weight_buffer,
-            rows,
-            cols,
-            0,
-            destination_offset,
-            radius,
-            false,
-            keep_buffers,
-            keep_bind_groups,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn encode_blur(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        source: &wgpu::Buffer,
-        destination: &wgpu::Buffer,
-        weights: &wgpu::Buffer,
-        rows: usize,
-        cols: usize,
-        source_offset: usize,
-        destination_offset: usize,
-        radius: usize,
-        vertical: bool,
-        keep_buffers: &mut Vec<wgpu::Buffer>,
-        keep_bind_groups: &mut Vec<wgpu::BindGroup>,
-    ) {
-        let uniform = uniform_buffer(
-            &self.device,
-            &self.queue,
-            "omvg-sift-blur",
+        let (weights, radius) = weights;
+        if *radius <= FUSED_BLUR_MAX_RADIUS {
+            let in_place = pair.source == pair.destination;
+            let bind_group = self.bind(
+                params,
+                &self.layouts.blur,
+                &BlurParams {
+                    rows_cols: [pair.rows as u32, pair.cols as u32],
+                    src_off: pair.source_offset as u32,
+                    dst_off: pair.destination_offset as u32,
+                    radius: *radius as u32,
+                    wt_off: 0,
+                    vertical: 0,
+                    dog: u32::from(pair.dog_offset.is_some()),
+                    dog_off: pair.dog_offset.unwrap_or(0) as u32,
+                    in_place: u32::from(in_place),
+                    pad: [0; 2],
+                },
+                &[
+                    if in_place { pair.temp } else { pair.source },
+                    pair.destination,
+                    weights,
+                    pair.dog,
+                ],
+            );
+            self.dispatch(
+                encoder,
+                "omvg-sift-blur-fused",
+                &self.pipelines.blur_fused,
+                &bind_group,
+                [
+                    (pair.rows as u32).div_ceil(FUSED_BLUR_ROWS),
+                    (pair.cols as u32).div_ceil(FUSED_BLUR_COLS),
+                    1,
+                ],
+            );
+            return;
+        }
+        let workgroups = [
+            (pair.rows as u32).div_ceil(16),
+            (pair.cols as u32).div_ceil(16),
+            1,
+        ];
+        let first = self.bind(
+            params,
+            &self.layouts.blur,
             &BlurParams {
-                rows_cols: [rows as u32, cols as u32],
-                src_off: source_offset as u32,
-                dst_off: destination_offset as u32,
-                radius: radius as u32,
+                rows_cols: [pair.rows as u32, pair.cols as u32],
+                src_off: pair.source_offset as u32,
+                dst_off: 0,
+                radius: *radius as u32,
                 wt_off: 0,
-                vertical: u32::from(vertical),
-                pad: 0,
+                vertical: 1,
+                dog: 0,
+                dog_off: 0,
+                in_place: 0,
+                pad: [0; 2],
             },
+            &[pair.source, pair.temp, weights, pair.dog],
         );
-        keep_buffers.push(uniform.clone());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("omvg-sift-blur"),
-            layout: &self.layouts.blur,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: source.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: destination.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: weights.as_entire_binding(),
-                },
-            ],
-        });
-        keep_bind_groups.push(bind_group);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("omvg-sift-blur"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipelines.blur);
-        pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
-        pass.dispatch_workgroups((rows as u32).div_ceil(16), (cols as u32).div_ceil(16), 1);
+        self.dispatch(
+            encoder,
+            "omvg-sift-blur",
+            &self.pipelines.blur,
+            &first,
+            workgroups,
+        );
+        let second = self.bind(
+            params,
+            &self.layouts.blur,
+            &BlurParams {
+                rows_cols: [pair.rows as u32, pair.cols as u32],
+                src_off: 0,
+                dst_off: pair.destination_offset as u32,
+                radius: *radius as u32,
+                wt_off: 0,
+                vertical: 0,
+                dog: u32::from(pair.dog_offset.is_some()),
+                dog_off: pair.dog_offset.unwrap_or(0) as u32,
+                in_place: 0,
+                pad: [0; 2],
+            },
+            &[pair.temp, pair.destination, weights, pair.dog],
+        );
+        self.dispatch(
+            encoder,
+            "omvg-sift-blur",
+            &self.pipelines.blur,
+            &second,
+            workgroups,
+        );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn encode_decimate(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut Recorder,
+        params: &mut ParamArena,
         source: &wgpu::Buffer,
         destination: &wgpu::Buffer,
-        source_rows: usize,
-        source_cols: usize,
-        destination_rows: usize,
-        destination_cols: usize,
-        source_offset: usize,
-        keep_buffers: &mut Vec<wgpu::Buffer>,
-        keep_bind_groups: &mut Vec<wgpu::BindGroup>,
+        decimate: DecimateParams,
     ) {
-        let uniform = uniform_buffer(
-            &self.device,
-            &self.queue,
+        let bind_group = self.bind(
+            params,
+            &self.layouts.decimate,
+            &decimate,
+            &[source, destination],
+        );
+        self.dispatch(
+            encoder,
             "omvg-sift-decimate",
-            &DecimateParams {
-                src_rows_cols: [source_rows as u32, source_cols as u32],
-                dst_rows_cols: [destination_rows as u32, destination_cols as u32],
-                src_off: source_offset as u32,
-                dst_off: 0,
-                pad0: 0,
-                pad1: 0,
-            },
-        );
-        keep_buffers.push(uniform.clone());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("omvg-sift-decimate"),
-            layout: &self.layouts.decimate,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: source.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: destination.as_entire_binding(),
-                },
+            &self.pipelines.decimate,
+            &bind_group,
+            [
+                decimate.dst_rows_cols[0].div_ceil(16),
+                decimate.dst_rows_cols[1].div_ceil(16),
+                1,
             ],
-        });
-        keep_bind_groups.push(bind_group);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("omvg-sift-decimate"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipelines.decimate);
-        pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
-        pass.dispatch_workgroups(
-            (destination_rows as u32).div_ceil(16),
-            (destination_cols as u32).div_ceil(16),
-            1,
         );
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn encode_dog(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        source: &wgpu::Buffer,
-        destination: &wgpu::Buffer,
-        rows: usize,
-        cols: usize,
-        source_offset: usize,
-        source_next_offset: usize,
-        destination_offset: usize,
-        keep_buffers: &mut Vec<wgpu::Buffer>,
-        keep_bind_groups: &mut Vec<wgpu::BindGroup>,
-    ) {
-        let uniform = uniform_buffer(
-            &self.device,
-            &self.queue,
-            "omvg-sift-dog",
-            &DogParams {
-                rows_cols: [rows as u32, cols as u32],
-                src_off: source_offset as u32,
-                src_next_off: source_next_offset as u32,
-                dst_off: destination_offset as u32,
-                pad0: 0,
-            },
-        );
-        keep_buffers.push(uniform.clone());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("omvg-sift-dog"),
-            layout: &self.layouts.dog,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: source.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: destination.as_entire_binding(),
-                },
-            ],
-        });
-        keep_bind_groups.push(bind_group);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("omvg-sift-dog"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipelines.dog);
-        pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
-        pass.dispatch_workgroups((rows as u32).div_ceil(16), (cols as u32).div_ceil(16), 1);
+/// A command encoder that records consecutive dispatches into one open
+/// compute pass. Buffer copies and clears end the pass first.
+struct Recorder {
+    encoder: wgpu::CommandEncoder,
+    pass: Option<wgpu::ComputePass<'static>>,
+}
+
+impl Recorder {
+    fn new(device: &wgpu::Device, label: &str) -> Self {
+        Self {
+            encoder: device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) }),
+            pass: None,
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn encode_extrema(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        dog: &wgpu::Buffer,
-        candidates: &wgpu::Buffer,
-        count: &wgpu::Buffer,
-        rows: usize,
-        cols: usize,
-        levels: usize,
-        threshold: f32,
-        octave: usize,
-        capacity: usize,
-        keep_buffers: &mut Vec<wgpu::Buffer>,
-        keep_bind_groups: &mut Vec<wgpu::BindGroup>,
-    ) {
-        let uniform = uniform_buffer(
-            &self.device,
-            &self.queue,
-            "omvg-sift-extrema",
-            &ExtremaParams {
-                rows_cols: [rows as u32, cols as u32],
-                levels: levels as u32,
-                threshold,
-                octave: octave as u32,
-                cap: capacity as u32,
-                pad0: 0,
-                pad1: 0,
-            },
-        );
-        keep_buffers.push(uniform.clone());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("omvg-sift-extrema"),
-            layout: &self.layouts.extrema,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: dog.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: candidates.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: count.as_entire_binding(),
-                },
-            ],
-        });
-        keep_bind_groups.push(bind_group);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("omvg-sift-extrema"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipelines.extrema);
-        pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
-        pass.dispatch_workgroups(
-            (rows as u32).div_ceil(8),
-            (cols as u32).div_ceil(8),
-            levels.saturating_sub(3).max(1) as u32,
-        );
+    /// The encoder for non-dispatch commands, after ending any open pass.
+    fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
+        self.pass = None;
+        &mut self.encoder
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn encode_refine(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        dog: &wgpu::Buffer,
-        candidates: &wgpu::Buffer,
-        count: &wgpu::Buffer,
-        refined: &wgpu::Buffer,
-        out_count: &wgpu::Buffer,
-        rows: usize,
-        cols: usize,
-        levels: usize,
-        num_scales: usize,
-        delta: f32,
-        sigma_min: f32,
-        delta_min: f32,
-        edge_threshold: f32,
-        peak_threshold: f32,
-        octave: usize,
-        capacity: usize,
-        keep_buffers: &mut Vec<wgpu::Buffer>,
-        keep_bind_groups: &mut Vec<wgpu::BindGroup>,
-    ) {
-        let refine_workgroups = REFINE_WORKGROUPS.min(capacity.div_ceil(64).max(1) as u32);
-        let uniform = uniform_buffer(
-            &self.device,
-            &self.queue,
-            "omvg-sift-refine",
-            &RefineParams {
-                rows_cols: [rows as u32, cols as u32],
-                levels: levels as u32,
-                num_scales: num_scales as u32,
-                delta,
-                sigma_min,
-                delta_min,
-                edge_threshold,
-                peak_threshold,
-                cap: capacity as u32,
-                octave: octave as u32,
-                grid_workgroups: refine_workgroups,
-                pad1: [0; 4],
-            },
-        );
-        keep_buffers.push(uniform.clone());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("omvg-sift-refine"),
-            layout: &self.layouts.refine,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: dog.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: candidates.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: count.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: refined.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: out_count.as_entire_binding(),
-                },
-            ],
-        });
-        keep_bind_groups.push(bind_group);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("omvg-sift-refine"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipelines.refine);
-        pass.set_bind_group(0, &keep_bind_groups[keep_bind_groups.len() - 1], &[]);
-        pass.dispatch_workgroups(refine_workgroups, 1, 1);
+    fn finish(mut self) -> wgpu::CommandBuffer {
+        self.pass = None;
+        self.encoder.finish()
+    }
+}
+
+/// Buffers and planes of one [`Engine::encode_blur_pair`] call.
+struct BlurPair<'a> {
+    source: &'a wgpu::Buffer,
+    temp: &'a wgpu::Buffer,
+    destination: &'a wgpu::Buffer,
+    dog: &'a wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    source_offset: usize,
+    destination_offset: usize,
+    dog_offset: Option<usize>,
+}
+
+/// A 2D grid of 64-invocation workgroups covering at least `count` items,
+/// for the `order.wgsl` kernels.
+fn item_grid(count: usize) -> [u32; 3] {
+    workgroup_grid(count.div_ceil(64))
+}
+
+/// A 2D workgroup grid holding at least `count` workgroups, for kernels that
+/// own one item per workgroup; dispatch dimensions are limited to 65535.
+fn workgroup_grid(count: usize) -> [u32; 3] {
+    const MAX: usize = 65_535;
+    let count = count.max(1);
+    if count <= MAX {
+        [count as u32, 1, 1]
+    } else {
+        [MAX as u32, count.div_ceil(MAX) as u32, 1]
+    }
+}
+
+/// Size of one parameter slot; every uniform struct fits and the device
+/// offset alignment divides it (checked when the engine is created).
+const PARAM_SLOT_BYTES: u64 = 256;
+const PARAM_PAGE_SLOTS: usize = 256;
+
+/// One extraction's uniform parameters. Each pass gets a slot in a page of a
+/// persistent uniform buffer; the bytes are staged on the host and written
+/// once per submit, instead of one buffer and one write per pass. Pages are
+/// kept between extractions and added only when an extraction needs more.
+#[derive(Default)]
+struct ParamArena {
+    pages: Vec<wgpu::Buffer>,
+    data: Vec<u8>,
+    flushed: usize,
+}
+
+impl ParamArena {
+    fn reset(&mut self) {
+        self.data.clear();
+        self.flushed = 0;
+    }
+
+    fn push<T: bytemuck::Pod>(&mut self, device: &wgpu::Device, value: &T) -> (wgpu::Buffer, u64) {
+        let slot = self.data.len() / PARAM_SLOT_BYTES as usize;
+        let page = slot / PARAM_PAGE_SLOTS;
+        let bytes = bytemuck::bytes_of(value);
+        self.data.extend_from_slice(bytes);
+        self.data.resize((slot + 1) * PARAM_SLOT_BYTES as usize, 0);
+        while self.pages.len() <= page {
+            self.pages
+                .push(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("omvg-sift-params"),
+                    size: PARAM_SLOT_BYTES * PARAM_PAGE_SLOTS as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+        }
+        let offset = (slot % PARAM_PAGE_SLOTS) as u64 * PARAM_SLOT_BYTES;
+        (self.pages[page].clone(), offset)
+    }
+
+    /// Write the slots added since the previous flush. Call before submitting
+    /// the commands that read them; queue writes land before that submit.
+    fn flush(&mut self, queue: &wgpu::Queue) {
+        let page_bytes = PARAM_SLOT_BYTES as usize * PARAM_PAGE_SLOTS;
+        while self.flushed < self.data.len() {
+            let page = self.flushed / page_bytes;
+            let end = self.data.len().min((page + 1) * page_bytes);
+            queue.write_buffer(
+                &self.pages[page],
+                (self.flushed - page * page_bytes) as u64,
+                &self.data[self.flushed..end],
+            );
+            self.flushed = end;
+        }
     }
 }
 
@@ -2071,16 +2131,12 @@ impl Layouts {
                     storage(1, true),
                     storage(2, false),
                     storage(3, true),
+                    storage(4, false),
                 ],
             ),
             decimate: layout(
                 device,
                 "omvg-sift-decimate",
-                &[uniform(0), storage(1, true), storage(2, false)],
-            ),
-            dog: layout(
-                device,
-                "omvg-sift-dog",
                 &[uniform(0), storage(1, true), storage(2, false)],
             ),
             extrema: layout(
@@ -2115,6 +2171,18 @@ impl Layouts {
                     storage(3, false),
                     storage(4, false),
                     storage(5, false),
+                    storage(6, true),
+                ],
+            ),
+            order: layout(
+                device,
+                "omvg-sift-order",
+                &[
+                    uniform(0),
+                    storage(1, true),
+                    storage(2, false),
+                    storage(3, false),
+                    storage(4, false),
                 ],
             ),
             compact: layout(
@@ -2146,6 +2214,10 @@ impl Layouts {
 
 impl Pipelines {
     fn new(device: &wgpu::Device, layouts: &Layouts) -> Self {
+        let order = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("omvg-sift-order"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/order.wgsl").into()),
+        });
         Self {
             init: pipeline(
                 device,
@@ -2159,17 +2231,17 @@ impl Pipelines {
                 layouts.blur.clone(),
                 include_str!("shaders/blur.wgsl"),
             ),
+            blur_fused: pipeline(
+                device,
+                "omvg-sift-blur-fused",
+                layouts.blur.clone(),
+                include_str!("shaders/blur_fused.wgsl"),
+            ),
             decimate: pipeline(
                 device,
                 "omvg-sift-decimate",
                 layouts.decimate.clone(),
                 include_str!("shaders/decimate.wgsl"),
-            ),
-            dog: pipeline(
-                device,
-                "omvg-sift-dog",
-                layouts.dog.clone(),
-                include_str!("shaders/dog.wgsl"),
             ),
             extrema: pipeline(
                 device,
@@ -2201,6 +2273,13 @@ impl Pipelines {
                 layouts.describe.clone(),
                 include_str!("shaders/describe.wgsl"),
             ),
+            order_hist: order_pipeline(device, &order, &layouts.order, "hist"),
+            order_scan: order_pipeline(device, &order, &layouts.order, "scan"),
+            order_scatter: order_pipeline(device, &order, &layouts.order, "scatter"),
+            order_bucket_sort: order_pipeline(device, &order, &layouts.order, "bucket_sort"),
+            order_hash: order_pipeline(device, &order, &layouts.order, "hash_insert"),
+            order_flag: order_pipeline(device, &order, &layouts.order, "flag"),
+            order_emit: order_pipeline(device, &order, &layouts.order, "emit"),
         }
     }
 }
@@ -2225,6 +2304,27 @@ fn pipeline(
         layout: Some(&layout),
         module: &module,
         entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+fn order_pipeline(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    bind_group_layout: &wgpu::BindGroupLayout,
+    entry_point: &str,
+) -> wgpu::ComputePipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("omvg-sift-order"),
+        bind_group_layouts: &[Some(bind_group_layout)],
+        immediate_size: 0,
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(entry_point),
+        layout: Some(&layout),
+        module,
+        entry_point: Some(entry_point),
         compilation_options: Default::default(),
         cache: None,
     })
@@ -2294,29 +2394,27 @@ fn storage_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffe
     )
 }
 
-fn uniform_buffer<T: bytemuck::Pod>(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    label: &str,
-    value: &T,
-) -> wgpu::Buffer {
-    let bytes = bytemuck::bytes_of(value);
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: (bytes.len().max(16).div_ceil(16) * 16) as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&buffer, 0, bytes);
-    buffer
-}
-
 fn read_buffers(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     staging_buffer: &mut GrowBuffer,
     ranges: &[(&wgpu::Buffer, usize)],
 ) -> Result<(Vec<u8>, Vec<usize>), RunError> {
+    read_buffers_with(device, queue, staging_buffer, ranges, |data, offsets| {
+        (data.to_vec(), offsets.to_vec())
+    })
+}
+
+/// Copy the leading `bytes` of each buffer into one staging buffer, wait for
+/// the GPU, and run `decode` on the mapped bytes and each range's offset in
+/// them, without first copying the mapping into host memory.
+fn read_buffers_with<R>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    staging_buffer: &mut GrowBuffer,
+    ranges: &[(&wgpu::Buffer, usize)],
+    decode: impl FnOnce(&[u8], &[usize]) -> R,
+) -> Result<R, RunError> {
     let mut offsets = Vec::with_capacity(ranges.len());
     let mut total = 0usize;
     for &(_, bytes) in ranges {
@@ -2330,7 +2428,7 @@ fn read_buffers(
             .ok_or(RunError::Capacity { what: "readback" })?;
     }
     if total == 0 {
-        return Ok((Vec::new(), offsets));
+        return Ok(decode(&[], &offsets));
     }
     let staging = staging_buffer.ensure_readback(device, "omvg-sift-staging", total);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2355,83 +2453,104 @@ fn read_buffers(
         .recv()
         .map_err(|error| RunError::Readback(error.to_string()))?
         .map_err(|error| RunError::Readback(format!("{error:?}")))?;
-    let data = slice
-        .get_mapped_range()
-        .map_err(|error| RunError::Readback(error.to_string()))?
-        .to_vec();
+    let result = {
+        let data = slice
+            .get_mapped_range()
+            .map_err(|error| RunError::Readback(error.to_string()))?;
+        decode(&data, &offsets)
+    };
     staging.unmap();
-    Ok((data, offsets))
+    Ok(result)
 }
 
+/// Pair each described feature with its descriptor, in detector order.
+///
+/// Readbacks come in octave order and each covers its octave's features in
+/// order, so visiting them in turn visits `detection.features` in order.
+/// `descriptor(local, offset)` decodes the descriptor of key `local` of a
+/// readback whose values start at `offset`; keys flagged invalid on the GPU,
+/// and descriptors the storage rejects, are dropped like on the CPU.
 fn assemble_features<D>(
-    detection: Detection,
-    descriptors: Vec<Option<D>>,
+    detection: &Detection,
+    readbacks: &[DescriptorReadback],
+    offsets: &[usize],
+    descriptor: impl Fn(usize, usize) -> Option<D>,
+    data: &[u8],
 ) -> ScaleSpaceFeatures<D> {
     let mut features = ScaleSpaceFeatures::default();
     features.keypoints.reserve(detection.features.len());
     features.descriptors.reserve(detection.features.len());
-    for (feature, descriptor) in detection.features.into_iter().zip(descriptors) {
-        if let Some(descriptor) = descriptor {
-            features.keypoints.push(feature.geometry());
-            features.descriptors.push(descriptor);
+    for (readback, offsets) in readbacks.iter().zip(offsets.as_chunks::<2>().0) {
+        let valid = &data[offsets[0]..offsets[0] + readback.key_count * 4];
+        for (local, flag) in valid.as_chunks::<4>().0.iter().enumerate() {
+            if u32::from_le_bytes(*flag) == 0 {
+                continue;
+            }
+            if let (Some(feature), Some(descriptor)) = (
+                detection.features.get(readback.feature_indices[local]),
+                descriptor(local, offsets[1]),
+            ) {
+                features.keypoints.push(feature.geometry());
+                features.descriptors.push(descriptor);
+            }
         }
     }
     features
 }
 
-fn decode_f32_descriptors<D: DescriptorStorage>(
-    data: &[u8],
-    readbacks: &[DescriptorReadback],
-    offsets: &[usize],
-    feature_count: usize,
-) -> Vec<Option<D>> {
-    let mut descriptors: Vec<Option<D>> = (0..feature_count).map(|_| None).collect();
-    for (readback, offsets) in readbacks.iter().zip(offsets.as_chunks::<2>().0) {
-        let valid_offset = offsets[0];
-        let values_offset = offsets[1];
-        for local in 0..readback.key_count {
-            if read_u32(data, valid_offset + local * 4) == 0 {
-                continue;
-            }
-            let base = values_offset + local * SIFT_DESCR_SIZE * 4;
-            let mut values = [0.0f32; SIFT_DESCR_SIZE];
-            for (index, value) in values.iter_mut().enumerate() {
-                *value = read_f32(data, base + index * 4);
-            }
-            if let Ok(descriptor) = D::try_from_finalized(&values) {
-                descriptors[readback.feature_indices[local]] = Some(descriptor);
-            }
-        }
+/// Pack `pixels` four per `u32` (little endian) into `packed` when every
+/// value is exactly an integer in `[0, 255]`; return whether it did.
+/// `packed` holds `pixels.len().div_ceil(4)` words.
+///
+/// Adding 2^23 moves an integer in `[0, 255]` into the low mantissa bits, so
+/// the byte is read from the sum and exactness is checked by subtracting it
+/// again. The range check compares bit patterns, so `-0.0`, NaN and negative
+/// values keep the f32 upload and the GPU input is bit-identical to `pixels`.
+/// The loop is branch-free so it vectorizes; with `parallel` it also splits
+/// the image over Rayon workers.
+fn pack_u8_image(pixels: &[f32], packed: &mut [u32]) -> bool {
+    const BLOCK: usize = 1 << 16;
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        packed
+            .par_chunks_mut(BLOCK / 4)
+            .zip(pixels.par_chunks(BLOCK))
+            .map(|(words, pixels)| pack_u8_block(pixels, words))
+            .reduce(|| true, |a, b| a && b)
     }
-    descriptors
+    #[cfg(not(feature = "parallel"))]
+    {
+        packed
+            .chunks_mut(BLOCK / 4)
+            .zip(pixels.chunks(BLOCK))
+            .fold(true, |exact, (words, pixels)| {
+                pack_u8_block(pixels, words) && exact
+            })
+    }
 }
 
-fn decode_u8_descriptors(
-    data: &[u8],
-    readbacks: &[DescriptorReadback],
-    offsets: &[usize],
-    feature_count: usize,
-) -> Vec<Option<U8Descriptor>> {
-    let mut descriptors: Vec<Option<U8Descriptor>> = (0..feature_count).map(|_| None).collect();
-    for (readback, offsets) in readbacks.iter().zip(offsets.as_chunks::<2>().0) {
-        let valid_offset = offsets[0];
-        let values_offset = offsets[1];
-        for local in 0..readback.key_count {
-            if read_u32(data, valid_offset + local * 4) == 0 {
-                continue;
-            }
-            let mut bytes = [0u8; SIFT_DESCR_SIZE];
-            let base = values_offset + local * PACKED_DESCR_WORDS * 4;
-            for (word_index, chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let word = read_u32(data, base + word_index * 4);
-                chunk.copy_from_slice(&word.to_le_bytes());
-            }
-            if let Ok(descriptor) = U8Descriptor::try_new(bytes, 255.0) {
-                descriptors[readback.feature_indices[local]] = Some(descriptor);
-            }
+fn pack_u8_block(pixels: &[f32], words: &mut [u32]) -> bool {
+    const MAGIC: f32 = 8_388_608.0;
+    const MAX_BITS: u32 = 0x437f_0000; // 255.0
+    let mut inexact = 0u32;
+    let mut pack = |values: &[f32]| {
+        let mut word = 0u32;
+        for (lane, &value) in values.iter().enumerate() {
+            let shifted = value + MAGIC;
+            inexact |= u32::from(value.to_bits() > MAX_BITS) | u32::from(shifted - MAGIC != value);
+            word |= (shifted.to_bits() & 0xff) << (8 * lane);
         }
+        word
+    };
+    let (chunks, tail) = pixels.as_chunks::<4>();
+    for (word, chunk) in words.iter_mut().zip(chunks) {
+        *word = pack(chunk);
     }
-    descriptors
+    if let Some(word) = words.get_mut(chunks.len()) {
+        *word = pack(tail);
+    }
+    inexact == 0
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -2461,22 +2580,25 @@ fn gaussian_weights(sigma: f32) -> Vec<f32> {
         .collect()
 }
 
+/// The blur weight buffer and kernel radius for `sigma`, uploaded once and
+/// then reused for every image.
 fn cached_gaussian_weights(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    scratch: &mut Scratch,
+    cache: &mut BTreeMap<u32, (wgpu::Buffer, usize)>,
     sigma: f32,
-    kernel: &[f32],
-) -> wgpu::Buffer {
+) -> (wgpu::Buffer, usize) {
     let key = sigma.to_bits();
-    if let Some(buffer) = scratch.blur_weights.get(&key) {
-        return buffer.clone();
+    if let Some(entry) = cache.get(&key) {
+        return entry.clone();
     }
+    let kernel = gaussian_weights(sigma);
+    let radius = kernel.len().saturating_sub(1);
     let bytes = kernel.len().saturating_mul(core::mem::size_of::<f32>());
     let buffer = storage_buffer(device, "omvg-sift-blur-weights", bytes as u64);
-    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(kernel));
-    scratch.blur_weights.insert(key, buffer.clone());
-    buffer
+    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&kernel));
+    cache.insert(key, (buffer.clone(), radius));
+    (buffer, radius)
 }
 
 // =============================================================================
@@ -2491,7 +2613,7 @@ struct InitParams {
     src_off: u32,
     dst_off: u32,
     upscale: u32,
-    pad: u32,
+    packed: u32,
 }
 
 #[repr(C)]
@@ -2503,7 +2625,10 @@ struct BlurParams {
     radius: u32,
     wt_off: u32,
     vertical: u32,
-    pad: u32,
+    dog: u32,
+    dog_off: u32,
+    in_place: u32,
+    pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -2515,16 +2640,6 @@ struct DecimateParams {
     dst_off: u32,
     pad0: u32,
     pad1: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct DogParams {
-    rows_cols: [u32; 2],
-    src_off: u32,
-    src_next_off: u32,
-    dst_off: u32,
-    pad0: u32,
 }
 
 #[repr(C)]
@@ -2606,6 +2721,42 @@ struct GpuRefined {
     orig_j: i32,
     accepted: u32,
     pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct OrderParams {
+    n: u32,
+    rows: u32,
+    cols: u32,
+    buckets: u32,
+    pad0: u32,
+    hash_mask: u32,
+    inv_delta: f32,
+    scan_len: u32,
+    scan_src: u32,
+    scan_dst: u32,
+    scan_copy: u32,
+    off_count: u32,
+    off_start: u32,
+    off_cursor: u32,
+    off_sorted: u32,
+    off_hash_keys: u32,
+    off_hash_vals: u32,
+    off_slot: u32,
+    off_kept: u32,
+    off_pos: u32,
+}
+
+/// One kept feature as `order.wgsl` writes it.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuFeature {
+    x: f32,
+    y: f32,
+    sigma: f32,
+    peak: f32,
+    level: u32,
 }
 
 #[repr(C)]
@@ -2816,6 +2967,114 @@ mod tests {
             close_descriptors * 2 >= gpu_count,
             "{preset:?}: only {close_descriptors} of {gpu_count} descriptors matched the CPU"
         );
+    }
+
+    #[test]
+    fn packed_upload_accepts_only_exact_bytes() {
+        let mut words = vec![0u32; 2];
+        assert!(pack_u8_image(&[0.0, 1.0, 254.0, 255.0, 7.0], &mut words));
+        assert_eq!(words, [u32::from_le_bytes([0, 1, 254, 255]), 7]);
+        for value in [-0.0, 0.5, 255.5, 256.0, -1.0, f32::NAN, f32::INFINITY] {
+            let mut words = vec![0u32; 1];
+            assert!(
+                !pack_u8_image(&[3.0, value], &mut words),
+                "{value:?} must keep the f32 upload"
+            );
+        }
+    }
+
+    /// `synthetic_blobs` rounded to whole grey levels, as a decoded 8-bit
+    /// image would be, so the extractor takes the packed upload.
+    fn integer_blobs(size: usize) -> GrayImage {
+        synthetic_blobs(size).map(f32::round)
+    }
+
+    /// A 6x6 grid of blobs of varied size and contrast, rounded to whole
+    /// grey levels. Blobs share rows, so candidates share the counting-sort
+    /// buckets of `order.wgsl` and their column order matters.
+    fn integer_blob_grid() -> GrayImage {
+        let size = 192;
+        let mut image = GrayImage::from_element(size, size, 30.0);
+        for gy in 0..6 {
+            for gx in 0..6 {
+                let (x, y) = (16.0 + 32.0 * gx as f32, 16.0 + 32.0 * gy as f32);
+                let sigma = 2.0 + ((gx + 2 * gy) % 4) as f32;
+                let amplitude = if (gx + gy) % 2 == 0 { 160.0 } else { -25.0 };
+                for row in 0..size {
+                    for col in 0..size {
+                        let (dx, dy) = (col as f32 - x, row as f32 - y);
+                        image[(row, col)] +=
+                            amplitude * (-(dx * dx + dy * dy) / (2.0 * sigma * sigma)).exp();
+                    }
+                }
+            }
+        }
+        image.map(|value| value.round().clamp(0.0, 255.0))
+    }
+
+    #[test]
+    fn gpu_integer_image_keeps_cpu_detector_order() {
+        let Some(gpu) = gpu_or_skip(SiftPreset::High) else {
+            return;
+        };
+        let image = integer_blob_grid();
+        let gpu_features = match gpu.extract_u8(&image) {
+            Ok(features) => features,
+            Err(error) => panic!("GPU extraction failed: {error}"),
+        };
+        let cpu_features = match SiftExtractor::with_preset(SiftPreset::High).extract_u8(&image) {
+            Ok(features) => features,
+            Err(error) => panic!("CPU extraction failed: {error}"),
+        };
+        // Detector order is octave, then candidate (scale, row, column) order
+        // after deduplication; every orientation of one keypoint follows it.
+        // Compare the sequences of distinct keypoint geometries, which pins
+        // that order. Orientations are left to the parity tests: these
+        // isotropic blobs have nearly flat orientation histograms.
+        let geometries = |keypoints: &[ScaleSpaceKeypoint]| {
+            let mut sequence: Vec<(f32, f32, f32, usize)> = Vec::new();
+            for keypoint in keypoints {
+                let geometry = (keypoint.x, keypoint.y, keypoint.sigma, keypoint.octave);
+                if sequence.last() != Some(&geometry) {
+                    sequence.push(geometry);
+                }
+            }
+            sequence
+        };
+        let gpu_sequence = geometries(gpu_features.keypoints());
+        let cpu_sequence = geometries(cpu_features.keypoints());
+        assert!(!gpu_sequence.is_empty(), "the GPU found no keypoints");
+        assert_eq!(gpu_sequence.len(), cpu_sequence.len());
+        for (gpu, cpu) in gpu_sequence.iter().zip(&cpu_sequence) {
+            assert_eq!(gpu.3, cpu.3, "octave order differs: {gpu:?} vs {cpu:?}");
+            assert!(
+                (gpu.0 - cpu.0).abs() < 1e-2
+                    && (gpu.1 - cpu.1).abs() < 1e-2
+                    && (gpu.2 - cpu.2).abs() < 1e-2,
+                "detector order differs: GPU {gpu:?} vs CPU {cpu:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_packed_and_f32_uploads_agree() {
+        let Some(gpu) = gpu_or_skip(SiftPreset::Normal) else {
+            return;
+        };
+        let mut packed = integer_blobs(128);
+        packed[(0, 0)] = 0.0;
+        // `-0.0` is not an exact byte, so this copy takes the f32 upload; it
+        // normalizes to the same scale-space values.
+        let mut float = packed.clone();
+        float[(0, 0)] = -0.0;
+        let extract = |image: &GrayImage| match gpu.extract_u8(image) {
+            Ok(features) => features,
+            Err(error) => panic!("GPU extraction failed: {error}"),
+        };
+        let (packed, float) = (extract(&packed), extract(&float));
+        assert!(!packed.keypoints().is_empty());
+        assert_eq!(packed.keypoints(), float.keypoints());
+        assert_eq!(packed.descriptors(), float.descriptors());
     }
 
     #[test]
