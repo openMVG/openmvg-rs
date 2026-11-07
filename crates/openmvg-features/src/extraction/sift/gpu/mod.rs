@@ -561,6 +561,14 @@ struct Pipelines {
 
 impl Engine {
     fn new() -> Result<Self, SiftGpuError> {
+        // Creating wgpu devices on several threads at once can hang or crash
+        // in the Vulkan driver (seen with wgpu 30 on an NVIDIA L40S, without
+        // any SIFT work), so device creation is serialized process-wide.
+        // Extraction itself still runs concurrently on separate extractors.
+        static DEVICE_CREATION: Mutex<()> = Mutex::new(());
+        let creation = DEVICE_CREATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -577,6 +585,7 @@ impl Engine {
                 required_limits: limits,
                 ..Default::default()
             }))?;
+        drop(creation);
         let layouts = Layouts::new(&device);
         let pipelines = Pipelines::new(&device, &layouts);
         Ok(Self {
