@@ -9,6 +9,7 @@ const PI: f32 = 3.141592653589793;
 const TWO_PI: f32 = 6.283185307179586;
 const ORI_BINS: u32 = 36u;
 const MAX_PEAKS: u32 = 36u;
+const PREFIX_PEAKS: u32 = 8u;
 
 struct OriParams {
     rows_cols: vec2<u32>,
@@ -32,6 +33,7 @@ struct OriKey {
 @group(0) @binding(2) var<storage, read> keys: array<OriKey>;
 @group(0) @binding(3) var<storage, read_write> counts: array<u32>;
 @group(0) @binding(4) var<storage, read_write> orientations: array<f32>;
+@group(0) @binding(5) var<storage, read_write> prefix: array<f32>;
 
 fn gradient_at(col: i32, row: i32, level: u32) -> vec2<f32> {
     let cols = i32(p.rows_cols.y);
@@ -132,6 +134,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         if (slot < MAX_PEAKS) {
             orientations[id * MAX_PEAKS + slot] = orientation;
+            if (slot < PREFIX_PEAKS) {
+                prefix[id * PREFIX_PEAKS + slot] = orientation;
+            }
             slot += 1u;
         }
     }

@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Pierre Moulon and OpenMVG Rust contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Compacts the fixed-stride orientation peaks of one octave into the dense
-// orientation and descriptor-key buffers. One invocation owns one keypoint and
-// preserves keypoint order and peak (bin) order, so the host can expand the
-// result in detector order. The orientation values are copied unchanged.
+// Compacts the fixed-stride orientation peaks of one octave into a dense
+// descriptor-key buffer. One invocation owns one keypoint and preserves
+// keypoint order and peak (bin) order, so the result matches detector order.
+// The orientation values are copied unchanged.
 
 struct CompactParams {
     key_count: u32,
@@ -33,8 +33,7 @@ struct DescKey {
 @group(0) @binding(2) var<storage, read> offsets: array<u32>;
 @group(0) @binding(3) var<storage, read> orientations: array<f32>;
 @group(0) @binding(4) var<storage, read> keys: array<OriKey>;
-@group(0) @binding(5) var<storage, read_write> compact_orientations: array<f32>;
-@group(0) @binding(6) var<storage, read_write> descriptor_keys: array<DescKey>;
+@group(0) @binding(5) var<storage, read_write> descriptor_keys: array<DescKey>;
 
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -47,7 +46,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let key = keys[id];
     for (var slot = 0u; slot < count; slot += 1u) {
         let orientation = orientations[id * p.max_orientations + slot];
-        compact_orientations[base + slot] = orientation;
         descriptor_keys[base + slot] = DescKey(
             key.x,
             key.y,

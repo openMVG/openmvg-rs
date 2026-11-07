@@ -45,6 +45,7 @@ const MIN_INPUT_DIMENSION: usize = 8;
 const CANDIDATE_DIVISOR: usize = 32;
 const MIN_CANDIDATES: usize = 256;
 const MAX_ORIENTATIONS: usize = 36;
+const ORIENTATION_PREFIX: usize = 8;
 const CANDIDATE_BYTES: usize = 24;
 const REFINED_BYTES: usize = 56;
 const REFINE_WORKGROUPS: u32 = 256;
@@ -268,19 +269,19 @@ struct OrientationReadback {
     octave: usize,
     key_count: usize,
     count_bytes: usize,
+    orientation_bytes: usize,
+    prefix_bytes: usize,
     keys: wgpu::Buffer,
     counts: wgpu::Buffer,
     orientations: wgpu::Buffer,
+    prefix: wgpu::Buffer,
     indices: Vec<usize>,
 }
 
 struct OrientationCompaction {
     total: usize,
     counts: Vec<u32>,
-    offsets: Vec<u32>,
     offset_buffer: wgpu::Buffer,
-    compact_orientation_bytes: usize,
-    compact_orientations: wgpu::Buffer,
     compact_keys: wgpu::Buffer,
 }
 
@@ -407,7 +408,7 @@ struct Scratch {
     orientation_counts: Vec<GrowBuffer>,
     orientations: Vec<GrowBuffer>,
     orientation_offsets: Vec<GrowBuffer>,
-    compact_orientations: Vec<GrowBuffer>,
+    orientation_prefix: Vec<GrowBuffer>,
     descriptor_keys: Vec<GrowBuffer>,
     descriptors: Vec<GrowBuffer>,
     descriptor_valid: Vec<GrowBuffer>,
@@ -428,7 +429,7 @@ impl Scratch {
             self.orientations.resize_with(stages, GrowBuffer::default);
             self.orientation_offsets
                 .resize_with(stages, GrowBuffer::default);
-            self.compact_orientations
+            self.orientation_prefix
                 .resize_with(stages, GrowBuffer::default);
             self.descriptor_keys
                 .resize_with(stages, GrowBuffer::default);
@@ -488,7 +489,7 @@ impl Scratch {
                 .map(|buffer| buffer.allocations)
                 .sum::<usize>()
             + self
-                .compact_orientations
+                .orientation_prefix
                 .iter()
                 .map(|buffer| buffer.allocations)
                 .sum::<usize>()
@@ -1074,9 +1075,16 @@ impl Engine {
                 .ok_or(RunError::Capacity {
                     what: "orientations",
                 })?;
+            let prefix_bytes = key_count
+                .checked_mul(ORIENTATION_PREFIX)
+                .and_then(|count| count.checked_mul(core::mem::size_of::<f32>()))
+                .ok_or(RunError::Capacity {
+                    what: "orientation prefix",
+                })?;
             self.ensure_storage_capacity(key_bytes)?;
             self.ensure_storage_capacity(count_bytes)?;
             self.ensure_storage_capacity(orientation_bytes)?;
+            self.ensure_storage_capacity(prefix_bytes)?;
             let key_buffer = scratch.orientation_keys[octave].ensure_storage(
                 &self.device,
                 "omvg-sift-orientation-keys",
@@ -1093,6 +1101,11 @@ impl Engine {
                 &self.device,
                 "omvg-sift-orientations",
                 orientation_bytes,
+            );
+            let prefix = scratch.orientation_prefix[octave].ensure_storage(
+                &self.device,
+                "omvg-sift-orientation-prefix",
+                prefix_bytes,
             );
             let uniform = uniform_buffer(
                 &self.device,
@@ -1132,6 +1145,10 @@ impl Engine {
                         binding: 4,
                         resource: orientations.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: prefix.as_entire_binding(),
+                    },
                 ],
             });
             let mut encoder = self
@@ -1153,34 +1170,42 @@ impl Engine {
                 octave,
                 key_count,
                 count_bytes,
+                orientation_bytes,
+                prefix_bytes,
                 keys: key_buffer,
                 counts,
                 orientations,
+                prefix,
                 indices,
             });
         }
 
-        // Read only the per-keypoint orientation counts first. The fixed-stride
-        // orientation planes stay on the GPU; a compaction pass copies the used
-        // peaks into dense buffers in detector order.
-        let mut count_ranges = Vec::with_capacity(orientation_readbacks.len());
+        // Read the per-keypoint counts and the first few orientation peaks in
+        // one transfer. Most keypoints have a single dominant orientation, so
+        // the prefix covers the common case without touching the fixed-stride
+        // planes. Images with more peaks fall back to the full planes below.
+        let mut orientation_ranges = Vec::with_capacity(orientation_readbacks.len() * 2);
         for readback in &orientation_readbacks {
-            count_ranges.push((&readback.counts, readback.count_bytes));
+            orientation_ranges.push((&readback.counts, readback.count_bytes));
+            orientation_ranges.push((&readback.prefix, readback.prefix_bytes));
         }
-        let (count_data, count_offsets) = read_buffers(
+        let (prefix_data, prefix_offsets) = read_buffers(
             &self.device,
             &self.queue,
             &mut scratch.staging,
-            &count_ranges,
+            &orientation_ranges,
         )?;
         let mut compactions = Vec::with_capacity(orientation_readbacks.len());
+        let mut needs_full_orientations = false;
         for (index, readback) in orientation_readbacks.iter().enumerate() {
             let mut counts = Vec::with_capacity(readback.key_count);
             let mut offsets = Vec::with_capacity(readback.key_count);
             let mut total = 0usize;
+            let count_offset = prefix_offsets[index * 2];
             for local in 0..readback.key_count {
-                let count = read_u32(&count_data, count_offsets[index] + local * 4) as usize;
+                let count = read_u32(&prefix_data, count_offset + local * 4) as usize;
                 let count = count.min(MAX_ORIENTATIONS);
+                needs_full_orientations |= count > ORIENTATION_PREFIX;
                 counts.push(count as u32);
                 offsets.push(total as u32);
                 total = total.checked_add(count).ok_or(RunError::Capacity {
@@ -1193,19 +1218,12 @@ impl Engine {
                 .ok_or(RunError::Capacity {
                     what: "orientation offsets",
                 })?;
-            let compact_orientation_bytes =
-                total
-                    .checked_mul(core::mem::size_of::<f32>())
-                    .ok_or(RunError::Capacity {
-                        what: "compact orientations",
-                    })?;
             let compact_key_bytes = total
                 .checked_mul(core::mem::size_of::<GpuDescKey>())
                 .ok_or(RunError::Capacity {
                     what: "compact descriptor keys",
                 })?;
             self.ensure_storage_capacity(offset_bytes)?;
-            self.ensure_storage_capacity(compact_orientation_bytes)?;
             self.ensure_storage_capacity(compact_key_bytes)?;
             let offset_buffer = scratch.orientation_offsets[readback.octave].ensure_storage(
                 &self.device,
@@ -1214,12 +1232,6 @@ impl Engine {
             );
             self.queue
                 .write_buffer(&offset_buffer, 0, bytemuck::cast_slice(&offsets));
-            let compact_orientations = scratch.compact_orientations[readback.octave]
-                .ensure_storage(
-                    &self.device,
-                    "omvg-sift-compact-orientations",
-                    compact_orientation_bytes,
-                );
             let compact_keys = scratch.descriptor_keys[readback.octave].ensure_storage(
                 &self.device,
                 "omvg-sift-compact-keys",
@@ -1228,10 +1240,7 @@ impl Engine {
             compactions.push(OrientationCompaction {
                 total,
                 counts,
-                offsets,
                 offset_buffer,
-                compact_orientation_bytes,
-                compact_orientations,
                 compact_keys,
             });
         }
@@ -1283,10 +1292,6 @@ impl Engine {
                         },
                         wgpu::BindGroupEntry {
                             binding: 5,
-                            resource: compaction.compact_orientations.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
                             resource: compaction.compact_keys.as_entire_binding(),
                         },
                     ],
@@ -1307,32 +1312,48 @@ impl Engine {
             drop(keep_buffers);
         }
 
-        let mut compact_ranges = Vec::with_capacity(compactions.len());
-        for compaction in &compactions {
-            compact_ranges.push((
-                &compaction.compact_orientations,
-                compaction.compact_orientation_bytes,
-            ));
-        }
-        let (orientation_data, orientation_offsets) = read_buffers(
-            &self.device,
-            &self.queue,
-            &mut scratch.staging,
-            &compact_ranges,
-        )?;
         let mut oriented = Vec::new();
-        for ((readback, compaction), offset) in orientation_readbacks
-            .iter()
-            .zip(&compactions)
-            .zip(orientation_offsets)
-        {
-            for local in 0..readback.key_count {
-                let count = compaction.counts[local] as usize;
-                let base = compaction.offsets[local] as usize;
-                for slot in 0..count {
-                    let mut feature = refined[readback.indices[local]];
-                    feature.orientation = read_f32(&orientation_data, offset + (base + slot) * 4);
-                    oriented.push(feature);
+        if needs_full_orientations {
+            let mut ranges = Vec::with_capacity(orientation_readbacks.len());
+            for readback in &orientation_readbacks {
+                ranges.push((&readback.orientations, readback.orientation_bytes));
+            }
+            let (orientation_data, orientation_offsets) =
+                read_buffers(&self.device, &self.queue, &mut scratch.staging, &ranges)?;
+            for ((readback, compaction), orientation_offset) in orientation_readbacks
+                .iter()
+                .zip(&compactions)
+                .zip(orientation_offsets)
+            {
+                for local in 0..readback.key_count {
+                    let count = compaction.counts[local] as usize;
+                    for slot in 0..count {
+                        let mut feature = refined[readback.indices[local]];
+                        feature.orientation = read_f32(
+                            &orientation_data,
+                            orientation_offset + (local * MAX_ORIENTATIONS + slot) * 4,
+                        );
+                        oriented.push(feature);
+                    }
+                }
+            }
+        } else {
+            for ((readback, compaction), offsets) in orientation_readbacks
+                .iter()
+                .zip(&compactions)
+                .zip(prefix_offsets.as_chunks::<2>().0)
+            {
+                let prefix_offset = offsets[1];
+                for local in 0..readback.key_count {
+                    let count = compaction.counts[local] as usize;
+                    for slot in 0..count {
+                        let mut feature = refined[readback.indices[local]];
+                        feature.orientation = read_f32(
+                            &prefix_data,
+                            prefix_offset + (local * ORIENTATION_PREFIX + slot) * 4,
+                        );
+                        oriented.push(feature);
+                    }
                 }
             }
         }
@@ -2084,6 +2105,7 @@ impl Layouts {
                     storage(2, true),
                     storage(3, false),
                     storage(4, false),
+                    storage(5, false),
                 ],
             ),
             compact: layout(
@@ -2096,7 +2118,6 @@ impl Layouts {
                     storage(3, true),
                     storage(4, true),
                     storage(5, false),
-                    storage(6, false),
                 ],
             ),
             describe: layout(
