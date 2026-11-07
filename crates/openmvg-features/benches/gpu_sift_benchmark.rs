@@ -14,7 +14,10 @@
 //!
 //! Optional variables: `OMVG_SIFT_BENCH_PRESET` (`normal`, `high` or `ultra`),
 //! `OMVG_SIFT_BENCH_ROUNDS` (timed GPU rounds, default 5), `OMVG_SIFT_BENCH_CPU_ROUNDS`
-//! (default 1) and `OMVG_SIFT_BENCH_SKIP_CPU=1`. Setting `OMVG_SIFT_BENCH_DUMP` to a
+//! (default 1) and `OMVG_SIFT_BENCH_SKIP_CPU=1`. `OMVG_SIFT_BENCH_MEMORY=1` instead
+//! resizes the first image to several sizes and logs the GPU memory each size needs: the
+//! extractor's resident buffers and, where `nvidia-smi` is available, the device memory a
+//! fresh extractor adds, driver overhead included. Setting `OMVG_SIFT_BENCH_DUMP` to a
 //! directory writes the GPU features there; `OMVG_SIFT_BENCH_REF` compares the GPU features
 //! with such a dump, so a change can be checked for identical output.
 //!
@@ -174,6 +177,92 @@ impl Diff {
     }
 }
 
+/// Bilinear resize to `scale` times the size, keeping exact 8-bit values.
+fn resize(image: &GrayImage, scale: f32) -> GrayImage {
+    let rows = ((image.nrows() as f32 * scale).round() as usize).max(8);
+    let cols = ((image.ncols() as f32 * scale).round() as usize).max(8);
+    let sample = |row: usize, col: usize| {
+        let y = (row as f32 + 0.5) / scale - 0.5;
+        let x = (col as f32 + 0.5) / scale - 0.5;
+        let (y0, x0) = (y.floor().max(0.0) as usize, x.floor().max(0.0) as usize);
+        let (y1, x1) = (
+            (y0 + 1).min(image.nrows() - 1),
+            (x0 + 1).min(image.ncols() - 1),
+        );
+        let (y0, x0) = (y0.min(image.nrows() - 1), x0.min(image.ncols() - 1));
+        let (fy, fx) = (
+            (y - y0 as f32).clamp(0.0, 1.0),
+            (x - x0 as f32).clamp(0.0, 1.0),
+        );
+        let top = image[(y0, x0)] * (1.0 - fx) + image[(y0, x1)] * fx;
+        let bottom = image[(y1, x0)] * (1.0 - fx) + image[(y1, x1)] * fx;
+        (top * (1.0 - fy) + bottom * fy).round()
+    };
+    na::DMatrix::from_fn(rows, cols, sample)
+}
+
+/// Device memory in use according to `nvidia-smi`, in MiB, if it is available.
+fn device_memory_mib() -> Option<f64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+            "-i",
+            "0",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+fn memory_sweep(image: &GrayImage, preset: SiftPreset) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    println!(
+        "| Size | Megapixels | Features | Resident buffers (MiB) | Bytes per input pixel | Device memory added (MiB) | First call (ms) |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|");
+    for scale in [0.25f32, 0.5, 0.75, 1.0, 1.5, 2.0] {
+        let image = resize(image, scale);
+        let pixels = image.len() as f64;
+        let before = device_memory_mib();
+        let gpu = match SiftGpuExtractor::with_preset(preset) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("GPU extractor unavailable: {error}; skipping");
+                return;
+            }
+        };
+        let start = Instant::now();
+        let features = match gpu.extract_u8(&image) {
+            Ok(features) => features,
+            Err(error) => {
+                println!(
+                    "| {}x{} | {:.1} | {error} | | | | |",
+                    image.ncols(),
+                    image.nrows(),
+                    pixels / 1e6
+                );
+                continue;
+            }
+        };
+        let elapsed = ms(start);
+        let resident = gpu.resident_bytes() as f64;
+        let added = before
+            .zip(device_memory_mib())
+            .map(|(before, after)| after - before);
+        println!(
+            "| {}x{} | {:.1} | {} | {:.0} | {:.0} | {} | {elapsed:.1} |",
+            image.ncols(),
+            image.nrows(),
+            pixels / 1e6,
+            features.keypoints().len(),
+            resident / MIB,
+            resident / pixels,
+            added.map_or_else(|| "n/a".to_string(), |added| format!("{added:.0}")),
+        );
+    }
+}
+
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -283,6 +372,12 @@ fn main() {
         rayon::current_num_threads()
     );
 
+    if std::env::var("OMVG_SIFT_BENCH_MEMORY").is_ok_and(|value| value == "1") {
+        if let Some(image) = images.first() {
+            memory_sweep(image, preset);
+        }
+        return;
+    }
     let gpu = match SiftGpuExtractor::with_preset(preset) {
         Ok(gpu) => gpu,
         Err(error) => {

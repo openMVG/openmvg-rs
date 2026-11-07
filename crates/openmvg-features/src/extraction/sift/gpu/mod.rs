@@ -195,6 +195,16 @@ impl SiftGpuExtractor {
         Self::new(SiftExtractor::with_preset(preset))
     }
 
+    /// Bytes of GPU memory the extractor keeps allocated between calls.
+    ///
+    /// Scratch buffers grow to the largest image processed so far and are
+    /// released when the extractor is dropped. The device and driver add
+    /// their own overhead on top.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.engine.lock_scratch().resident_bytes()
+    }
+
     /// The detector configuration this extractor uses.
     #[must_use]
     pub fn config(&self) -> &SiftExtractor {
@@ -429,6 +439,10 @@ impl GrowBuffer {
         }
     }
 
+    fn bytes(&self) -> u64 {
+        self.buffer.as_ref().map_or(0, wgpu::Buffer::size)
+    }
+
     fn ensure_storage(&mut self, device: &wgpu::Device, label: &str, bytes: usize) -> wgpu::Buffer {
         self.ensure(
             device,
@@ -526,6 +540,52 @@ impl Scratch {
                 buffer
             }
         }
+    }
+
+    /// Bytes of every GPU buffer kept between extractions.
+    fn resident_bytes(&self) -> u64 {
+        let octaves = self.octaves.iter().map(|octave| {
+            [
+                &octave.gauss,
+                &octave.dog,
+                &octave.temp_a,
+                &octave.temp_b,
+                &octave.candidates,
+                &octave.refined,
+            ]
+            .iter()
+            .map(|buffer| buffer.bytes())
+            .sum::<u64>()
+                + [&octave.candidate_count, &octave.refined_count]
+                    .iter()
+                    .filter_map(|counter| counter.as_ref())
+                    .map(wgpu::Buffer::size)
+                    .sum::<u64>()
+        });
+        let stages = [
+            &self.order_work,
+            &self.ordered_features,
+            &self.orientation_keys,
+            &self.orientation_counts,
+            &self.orientations,
+            &self.orientation_offsets,
+            &self.orientation_prefix,
+            &self.descriptor_keys,
+            &self.descriptors,
+            &self.descriptor_valid,
+        ]
+        .into_iter()
+        .flatten()
+        .map(GrowBuffer::bytes);
+        let weights = self.blur_weights.values().map(|(buffer, _)| buffer.size());
+        let params = self.params.pages.iter().map(wgpu::Buffer::size);
+        octaves
+            .chain(stages)
+            .chain(weights)
+            .chain(params)
+            .sum::<u64>()
+            + self.source.bytes()
+            + self.staging.bytes()
     }
 
     #[cfg(test)]
@@ -3472,6 +3532,10 @@ mod tests {
             after_first > 0,
             "the first extraction must allocate scratch"
         );
+        let resident_first = gpu.resident_bytes();
+        // The scale space alone holds 6 Gaussian and 5 DoG planes of the
+        // 128 x 128 base octave.
+        assert!(resident_first >= 11 * 128 * 128 * 4);
 
         let repeated = match gpu.extract_u8(&small) {
             Ok(features) => features,
@@ -3495,6 +3559,8 @@ mod tests {
             after_large > after_first,
             "a larger image must grow at least one scratch buffer"
         );
+        let resident_large = gpu.resident_bytes();
+        assert!(resident_large > resident_first);
 
         let _ = match gpu.extract_u8(&small) {
             Ok(features) => features,
