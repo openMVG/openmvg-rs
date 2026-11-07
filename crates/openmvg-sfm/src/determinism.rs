@@ -19,6 +19,7 @@ pub(crate) const DEFAULT_ROOT_SEED: RunSeed = RunSeed::ZERO;
 pub(crate) const FEATURE_EXTRACTION_SEED_DOMAIN: &str = "pipeline/feature-extraction/v1";
 pub(crate) const PAIR_MATCHING_SEED_DOMAIN: &str = "pipeline/pair-matching/v1";
 pub(crate) const GEOMETRIC_VERIFICATION_SEED_DOMAIN: &str = "pipeline/geometric-verification/v1";
+pub(crate) const FOCAL_CALIBRATION_SEED_DOMAIN: &str = "pipeline/focal-calibration/v1";
 pub(crate) const POSE_REGISTRATION_SEED_DOMAIN: &str = "pipeline/pose-registration/v1";
 pub(crate) const GLOBAL_MIXED_POSITIONING_SEED_DOMAIN: &str =
     "pipeline/global/mixed-positioning/v1";

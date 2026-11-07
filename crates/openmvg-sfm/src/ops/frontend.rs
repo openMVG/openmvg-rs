@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Pierre Moulon and OpenMVG Rust contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The standard front-end sequence: extract, match, verify, optionally pre-calibrate radial
-//! distortion, and build tracks.
+//! The standard front-end sequence: extract, match, optionally pre-calibrate guessed focal
+//! lengths, verify, optionally pre-calibrate radial distortion, and build tracks.
 
 use crate::backends::{FeatureExtractor, GeometricVerifier, PairMatcher};
+use crate::ops::focal_calibration::{calibrate_guessed_focals_with_progress, has_guessed_focal};
 use crate::ops::radial_calibration::{
     calibrate_radial_distortion_with_progress, has_unknown_radial_distortion,
 };
@@ -18,6 +19,10 @@ use openmvg_geometry::averaging::view_graph::{StrengthEdge, keep_strongest_edges
 /// Extract features for images that have none, match the active pairs without matches, verify
 /// the active pairs without a model, and build tracks.
 ///
+/// `focal_calibration` estimates, before verification, the focal length of every camera group
+/// shared by two or more views whose focal is a guess; it is skipped when there is no such group
+/// or when some pair is already verified.
+///
 /// `radial_calibration` estimates `k1` before tracking for camera groups that declare a radial
 /// model with unknown (all-zero) distortion. The stage is skipped when no group does, so
 /// calibrated and pinhole cameras never enter it.
@@ -25,11 +30,13 @@ use openmvg_geometry::averaging::view_graph::{StrengthEdge, keep_strongest_edges
 /// `max_pairs_per_view` keeps only the verified pairs that are among each view's strongest
 /// (by inliers) at either end and deactivates the rest before tracking; `None` keeps every
 /// verified pair.
+#[allow(clippy::too_many_arguments)]
 pub fn run_frontend(
     workspace: &mut SfmWorkspace,
     extractor: &dyn FeatureExtractor,
     matcher: &dyn PairMatcher,
     verifier: &dyn GeometricVerifier,
+    focal_calibration: bool,
     radial_calibration: bool,
     max_pairs_per_view: Option<usize>,
     progress: &dyn SfmProgressSink,
@@ -54,6 +61,13 @@ pub fn run_frontend(
         .iter_populated()
         .map(|(_, matches)| matches.len())
         .sum();
+
+    // A focal change invalidates verified geometry, so only an unverified workspace is profiled.
+    let focal_calibration = (focal_calibration
+        && workspace.geometric_model_store().populated_count() == 0
+        && has_guessed_focal(workspace))
+    .then(|| calibrate_guessed_focals_with_progress(workspace, progress))
+    .transpose()?;
 
     workspace.verify_pairs_with_progress(verifier, PairSelector::Unverified, progress)?;
     let radial_calibration = (radial_calibration && has_unknown_radial_distortion(workspace))
@@ -85,6 +99,7 @@ pub fn run_frontend(
         filtered_pair_count: filtered_pairs,
         track_count: tracks.track_count,
         extraction_method: None,
+        focal_calibration,
         radial_calibration,
     })
 }

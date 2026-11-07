@@ -130,6 +130,12 @@ struct Cli {
     #[arg(long)]
     self_calibrate: Option<bool>,
 
+    /// Skip focal pre-calibration: shared camera groups whose focal is a guess (images without
+    /// focal metadata, with --share-intrinsics) keep the image-size guess until registration and
+    /// bundle adjustment refine it.
+    #[arg(long)]
+    no_focal_calibration: bool,
+
     /// Skip radial pre-calibration of EXIF radial camera groups (pinhole and K.txt cameras never
     /// get it).
     #[arg(long)]
@@ -270,6 +276,7 @@ impl Cli {
         let mut frontend = Frontend::default()
             .with_extraction_method(self.detector.extraction_method())
             .with_matching_method(self.matcher.matching_method())
+            .with_focal_calibration(!self.no_focal_calibration)
             .with_radial_calibration(!self.no_radial_calibration)
             .with_max_pairs_per_view(self.max_pairs_per_view);
         if let Some(density) = self.density {
@@ -661,7 +668,12 @@ mod tests {
             CameraModelType::PinholeRadial1
         );
         assert!(cli.self_calibrate.is_none());
-        assert!(!cli.no_radial_calibration && !cli.colmap && !cli.no_progress);
+        assert!(
+            !cli.no_focal_calibration
+                && !cli.no_radial_calibration
+                && !cli.colmap
+                && !cli.no_progress
+        );
         // With no front-end flag the command runs the library's recommended front end.
         assert_eq!(cli.frontend()?, Frontend::default());
         Ok(())

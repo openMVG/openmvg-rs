@@ -42,6 +42,9 @@ pub enum SfmProgressStage {
     Matching,
     /// Robust two-view geometric verification, counted in image pairs.
     Verification,
+    /// Focal-length estimation for shared camera groups whose focal is a guess, counted in camera
+    /// groups; it runs between matching and verification, fitting a fundamental matrix per pair.
+    FocalCalibration,
     /// Radial distortion estimation for camera groups whose distortion is unknown, counted in
     /// camera groups; it re-verifies the pairs incident to every group it re-models.
     RadialCalibration,
