@@ -188,6 +188,7 @@ struct Parity {
     exact_orientation: usize,
     exact_descriptor: usize,
     distance: f64,
+    orientation_errors: Vec<f32>,
 }
 
 /// Match each GPU keypoint to a CPU keypoint at the same octave within
@@ -229,6 +230,9 @@ fn parity(
         }
         if let Some((_, index)) = best {
             out.matched += 1;
+            let mut angle = (cpu.keypoints()[index].orientation - keypoint.orientation).abs();
+            angle = angle.min(std::f32::consts::TAU - angle);
+            out.orientation_errors.push(angle);
             if cpu.keypoints()[index].orientation.to_bits() == keypoint.orientation.to_bits() {
                 out.exact_orientation += 1;
             }
@@ -418,5 +422,21 @@ fn main() {
         100.0 * stats.exact_orientation as f64 / matched,
         100.0 * stats.exact_descriptor as f64 / matched,
         stats.distance / matched
+    );
+    let mut errors = stats.orientation_errors;
+    errors.sort_by(f32::total_cmp);
+    let quantile = |q: f64| {
+        errors
+            .get(((errors.len() as f64 - 1.0) * q).round() as usize)
+            .copied()
+            .unwrap_or(f32::NAN)
+    };
+    println!(
+        "Orientation error vs CPU (rad): mean {:.2e}, median {:.2e}, p99 {:.2e}, p99.9 {:.2e}, max {:.2e}",
+        errors.iter().map(|&e| f64::from(e)).sum::<f64>() / errors.len().max(1) as f64,
+        quantile(0.5),
+        quantile(0.99),
+        quantile(0.999),
+        quantile(1.0)
     );
 }
