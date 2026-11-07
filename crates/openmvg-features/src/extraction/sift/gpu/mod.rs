@@ -665,6 +665,7 @@ impl Scratch {
 struct Engine {
     _instance: wgpu::Instance,
     device: wgpu::Device,
+    use_fused_blur: bool,
     queue: wgpu::Queue,
     pipelines: Pipelines,
     layouts: Layouts,
@@ -786,6 +787,7 @@ impl Engine {
             apply_limit_buckets: false,
         }))
         .map_err(|_| SiftGpuError::NoAdapter)?;
+        let use_fused_blur = cfg!(feature = "gpu-fused-blur");
         let limits = adapter.limits();
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -819,6 +821,7 @@ impl Engine {
         Ok(Self {
             _instance: instance,
             device,
+            use_fused_blur,
             queue,
             pipelines,
             layouts,
@@ -2098,7 +2101,7 @@ impl Engine {
         pair: BlurPair<'_>,
     ) {
         let (weights, radius) = weights;
-        if *radius <= FUSED_BLUR_MAX_RADIUS {
+        if self.use_fused_blur && *radius <= FUSED_BLUR_MAX_RADIUS {
             let in_place = pair.source == pair.destination;
             let bind_group = self.bind(
                 params,
@@ -3159,7 +3162,8 @@ mod tests {
                 let cpu_keypoint = cpu_features.keypoints()[cpu_index];
                 let dx = gpu_keypoint.x - cpu_keypoint.x;
                 let dy = gpu_keypoint.y - cpu_keypoint.y;
-                if dx * dx + dy * dy <= 4.0 {
+                let distance = dx * dx + dy * dy;
+                if distance <= 4.0 {
                     geometry_matches += 1;
                 }
             }

@@ -2312,6 +2312,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "criterion",
+ "image",
  "libm",
  "nalgebra",
  "openmvg-core",

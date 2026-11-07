@@ -43,9 +43,11 @@ std = ["nalgebra/std", "dep:thiserror", "dep:openmvg-core", "dep:serde", "dep:pu
 parallel = ["std", "dep:rayon"]
 libm = ["nalgebra/libm", "dep:libm"]
 gpu = ["std", "dep:bytemuck", "dep:pollster", "dep:wgpu"]
+gpu-fused-blur = ["gpu"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+image = { workspace = true }
 rand = { workspace = true, features = ["std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

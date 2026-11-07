@@ -3,16 +3,16 @@
 
 //! CPU against GPU SIFT on a folder of real images.
 //!
-//! The crate has no image decoder, so the benchmark reads 8-bit binary PGM
-//! (`P5`) files. Convert a photo set once, for example with
-//! `python -c "from PIL import Image; Image.open('a.jpg').convert('L').save('a.pgm')"`, then run:
+//! The benchmark reads common raster formats (PGM, JPEG, PNG and TIFF) and
+//! converts them to 8-bit grayscale. For example:
 //!
 //! ```text
-//! OMVG_SIFT_BENCH_DIR=path/to/pgm cargo bench -p openmvg-features --features gpu \
+//! OMVG_SIFT_BENCH_DIR=path/to/images cargo bench --release -p openmvg-features --features gpu \
 //!     --bench gpu_sift_benchmark
 //! ```
 //!
 //! Optional variables: `OMVG_SIFT_BENCH_PRESET` (`normal`, `high` or `ultra`),
+//! `OMVG_SIFT_BENCH_LIMIT` (maximum number of images, default all),
 //! `OMVG_SIFT_BENCH_ROUNDS` (timed GPU rounds, default 5), `OMVG_SIFT_BENCH_CPU_ROUNDS`
 //! (default 1) and `OMVG_SIFT_BENCH_SKIP_CPU=1`. `OMVG_SIFT_BENCH_MEMORY=1` instead
 //! resizes the first image to several sizes and logs the GPU memory each size needs: the
@@ -340,9 +340,26 @@ fn parity(
     }
 }
 
+fn read_image(path: &Path) -> GrayImage {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if extension == "pgm" {
+        return read_pgm(path);
+    }
+    let image =
+        image::open(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let gray = image.into_luma8();
+    GrayImage::from_fn(gray.height() as usize, gray.width() as usize, |row, col| {
+        f32::from(gray[(col as u32, row as u32)].0[0])
+    })
+}
+
 fn main() {
     let Ok(directory) = std::env::var("OMVG_SIFT_BENCH_DIR") else {
-        eprintln!("set OMVG_SIFT_BENCH_DIR to a folder of 8-bit PGM images; skipping");
+        eprintln!("set OMVG_SIFT_BENCH_DIR to a folder of supported images; skipping");
         return;
     };
     let preset = match std::env::var("OMVG_SIFT_BENCH_PRESET").as_deref() {
@@ -361,10 +378,25 @@ fn main() {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&directory)
         .expect("readable image folder")
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "pgm"))
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "pgm" | "jpg" | "jpeg" | "png" | "tif" | "tiff"
+                    )
+                })
+        })
         .collect();
     paths.sort();
-    let images: Vec<GrayImage> = paths.iter().map(|path| read_pgm(path)).collect();
+    if let Some(limit) = std::env::var("OMVG_SIFT_BENCH_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        paths.truncate(limit);
+    }
+    let images: Vec<GrayImage> = paths.iter().map(|path| read_image(path)).collect();
     let (rows, cols) = images.first().map_or((0, 0), |image| image.shape());
     println!(
         "{} images from {directory}, first {cols}x{rows}, preset {preset:?}, {} Rayon threads",
