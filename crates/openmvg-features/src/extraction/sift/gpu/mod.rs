@@ -39,7 +39,7 @@
 //! [`GrayImage`]: crate::extraction::GrayImage
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::extraction::feature_budget::{FeatureBudgetKeypoint, apply_feature_budget};
 use crate::extraction::{
@@ -101,6 +101,27 @@ pub enum SiftGpuError {
     /// Reading a result buffer back to the host failed.
     #[error("GPU SIFT readback failed: {0}")]
     Readback(String),
+    /// The device ran out of memory for this image. The extractor rebuilds
+    /// its scratch buffers and stays usable; a smaller image or the CPU
+    /// extractor may succeed.
+    #[error("the GPU ran out of memory; use the CPU extractor for this image")]
+    OutOfMemory,
+    /// The device rejected a command. This indicates a bug in the backend;
+    /// the extractor rebuilds its scratch buffers and stays usable.
+    #[error("GPU SIFT command failed validation: {0}")]
+    Validation(String),
+    /// The device was lost or reported an internal error. Every later call
+    /// on this extractor returns this error; create a new extractor.
+    #[error("the GPU device was lost: {0}; create a new extractor")]
+    DeviceLost(String),
+    /// The device did not finish within [`SiftGpuExtractor::TIMEOUT`]. Every
+    /// later call on this extractor returns this error; create a new
+    /// extractor.
+    #[error("the GPU did not finish within {timeout:?}; create a new extractor")]
+    Timeout {
+        /// The wait that elapsed.
+        timeout: std::time::Duration,
+    },
 }
 
 /// GPU implementation of [`SiftExtractor`].
@@ -145,13 +166,18 @@ impl core::fmt::Debug for SiftGpuExtractor {
 }
 
 impl SiftGpuExtractor {
+    /// Longest wait for the device to finish one stage of an extraction
+    /// before the call fails with [`SiftGpuError::Timeout`].
+    pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Create a GPU extractor for `config`.
     ///
     /// # Errors
     ///
     /// Returns [`SiftGpuError::InvalidConfig`] if [`SiftExtractor::validate`]
-    /// rejects `config`, or [`SiftGpuError::NoAdapter`] /
-    /// [`SiftGpuError::Device`] if no GPU device can be created.
+    /// rejects `config`, [`SiftGpuError::NoAdapter`] /
+    /// [`SiftGpuError::Device`] if no GPU device can be created, or a device
+    /// error if the compute pipelines cannot be built.
     pub fn new(config: SiftExtractor) -> Result<Self, SiftGpuError> {
         config.validate()?;
         Ok(Self {
@@ -179,7 +205,9 @@ impl SiftGpuExtractor {
     ///
     /// # Errors
     ///
-    /// Returns an error if the GPU device or a result buffer fails.
+    /// Returns [`SiftGpuError::Capacity`] or [`SiftGpuError::OutOfMemory`]
+    /// when the image does not fit the device, and a device, timeout or
+    /// readback error when the GPU fails. GPU failures never panic.
     pub fn detect_keypoints(
         &self,
         image: &GrayImage,
@@ -193,7 +221,9 @@ impl SiftGpuExtractor {
     ///
     /// # Errors
     ///
-    /// Returns an error if the GPU device or a result buffer fails.
+    /// Returns [`SiftGpuError::Capacity`] or [`SiftGpuError::OutOfMemory`]
+    /// when the image does not fit the device, and a device, timeout or
+    /// readback error when the GPU fails. GPU failures never panic.
     pub fn extract_f32(
         &self,
         image: &GrayImage,
@@ -207,7 +237,9 @@ impl SiftGpuExtractor {
     ///
     /// # Errors
     ///
-    /// Returns an error if the GPU device or a result buffer fails.
+    /// Returns [`SiftGpuError::Capacity`] or [`SiftGpuError::OutOfMemory`]
+    /// when the image does not fit the device, and a device, timeout or
+    /// readback error when the GPU fails. GPU failures never panic.
     pub fn extract_u8(
         &self,
         image: &GrayImage,
@@ -221,7 +253,9 @@ impl SiftGpuExtractor {
     ///
     /// # Errors
     ///
-    /// Returns an error if the GPU device or a result buffer fails.
+    /// Returns [`SiftGpuError::Capacity`] or [`SiftGpuError::OutOfMemory`]
+    /// when the image does not fit the device, and a device, timeout or
+    /// readback error when the GPU fails. GPU failures never panic.
     pub fn extract_typed<D: DescriptorStorage>(
         &self,
         image: &GrayImage,
@@ -575,6 +609,72 @@ struct Engine {
     pipelines: Pipelines,
     layouts: Layouts,
     scratch: Mutex<Scratch>,
+    faults: Arc<Faults>,
+}
+
+/// Device errors that wgpu reports through callbacks rather than return
+/// values. Without a handler, wgpu panics on them.
+#[derive(Default)]
+struct Faults {
+    /// The first error reported since the last check, or the first fatal
+    /// one, which explains every error that follows it.
+    pending: Mutex<Option<Fault>>,
+    /// A failure after which the device cannot be trusted.
+    fatal: Mutex<Option<Fault>>,
+}
+
+#[derive(Clone, Debug)]
+enum Fault {
+    OutOfMemory,
+    Validation(String),
+    Lost(String),
+    Timeout,
+}
+
+impl Fault {
+    fn is_fatal(&self) -> bool {
+        matches!(self, Self::Lost(_) | Self::Timeout)
+    }
+}
+
+impl Faults {
+    fn record(&self, fault: Fault) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let replaces = match pending.as_ref() {
+            None => true,
+            Some(current) => fault.is_fatal() && !current.is_fatal(),
+        };
+        if replaces {
+            *pending = Some(fault);
+        }
+    }
+
+    fn take(&self) -> Option<Fault> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn fatal(&self) -> Option<Fault> {
+        self.fatal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_fatal(&self, fault: Fault) {
+        let mut fatal = self
+            .fatal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fatal.is_none() {
+            *fatal = Some(fault);
+        }
+    }
 }
 
 struct Layouts {
@@ -635,8 +735,27 @@ impl Engine {
                 ..Default::default()
             }))?;
         drop(creation);
+        // wgpu reports validation, out-of-memory and internal errors through
+        // this handler, and panics when none is installed. Record them and
+        // return them from the call that caused them.
+        let faults = Arc::new(Faults::default());
+        let handler_faults = Arc::clone(&faults);
+        device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            handler_faults.record(match error {
+                wgpu::Error::OutOfMemory { .. } => Fault::OutOfMemory,
+                wgpu::Error::Validation { description, .. } => Fault::Validation(description),
+                wgpu::Error::Internal { description, .. } => Fault::Lost(description),
+            });
+        }));
+        let lost_faults = Arc::clone(&faults);
+        device.set_device_lost_callback(move |reason, message| {
+            lost_faults.record(Fault::Lost(format!("{reason:?}: {message}")));
+        });
         let layouts = Layouts::new(&device);
         let pipelines = Pipelines::new(&device, &layouts);
+        if let Some(fault) = faults.take() {
+            return Err(RunError::Fault(fault).into());
+        }
         Ok(Self {
             _instance: instance,
             device,
@@ -644,13 +763,51 @@ impl Engine {
             pipelines,
             layouts,
             scratch: Mutex::new(Scratch::default()),
+            faults,
         })
     }
 
-    fn lock_scratch(&self) -> Result<MutexGuard<'_, Scratch>, RunError> {
-        self.scratch
-            .lock()
-            .map_err(|_| RunError::Readback("GPU scratch lock is poisoned".to_string()))
+    /// Run one extraction on the scratch buffers and turn device errors into
+    /// `RunError::Fault`.
+    ///
+    /// wgpu reports an error from the call that caused it, so the first error
+    /// recorded during `body` belongs to this extraction and takes precedence
+    /// over its result. After any device error the scratch buffers are
+    /// rebuilt, because one of them may be invalid; after a lost device or a
+    /// timeout every later call fails. A scratch lock poisoned by a panic in
+    /// another thread is recovered the same way.
+    fn run<T>(
+        &self,
+        body: impl FnOnce(&mut Scratch) -> Result<T, RunError>,
+    ) -> Result<T, RunError> {
+        if let Some(fault) = self.faults.fatal() {
+            return Err(RunError::Fault(fault));
+        }
+        let mut scratch = self.lock_scratch();
+        let result = body(&mut scratch);
+        let fault = match (self.faults.take(), &result) {
+            (Some(fault), _) => Some(fault),
+            (None, Err(RunError::Fault(fault))) => Some(fault.clone()),
+            (None, _) => None,
+        };
+        let Some(fault) = fault else {
+            return result;
+        };
+        *scratch = Scratch::default();
+        if fault.is_fatal() {
+            self.faults.set_fatal(fault.clone());
+        }
+        Err(RunError::Fault(fault))
+    }
+
+    fn lock_scratch(&self) -> MutexGuard<'_, Scratch> {
+        self.scratch.lock().unwrap_or_else(|poisoned| {
+            // A panic left the scratch in an unknown state; start over.
+            let mut scratch = poisoned.into_inner();
+            *scratch = Scratch::default();
+            self.scratch.clear_poison();
+            scratch
+        })
     }
 
     fn ensure_storage_capacity(&self, bytes: usize) -> Result<(), RunError> {
@@ -669,13 +826,14 @@ impl Engine {
         config: &SiftExtractor,
         image: &GrayImage,
     ) -> Result<Vec<ScaleSpaceKeypoint>, RunError> {
-        let mut scratch = self.lock_scratch()?;
-        let detection = self.detect_features(config, image, &mut scratch, false)?;
-        Ok(detection
-            .features
-            .into_iter()
-            .map(Feature::geometry)
-            .collect())
+        self.run(|scratch| {
+            let detection = self.detect_features(config, image, scratch, false)?;
+            Ok(detection
+                .features
+                .into_iter()
+                .map(Feature::geometry)
+                .collect())
+        })
     }
 
     fn extract<D: DescriptorStorage>(
@@ -683,9 +841,10 @@ impl Engine {
         config: &SiftExtractor,
         image: &GrayImage,
     ) -> Result<ScaleSpaceFeatures<D>, RunError> {
-        let mut scratch = self.lock_scratch()?;
-        let detection = self.detect_features(config, image, &mut scratch, true)?;
-        self.describe::<D>(config, &detection, &mut scratch)
+        self.run(|scratch| {
+            let detection = self.detect_features(config, image, scratch, true)?;
+            self.describe::<D>(config, &detection, scratch)
+        })
     }
 
     fn extract_u8(
@@ -693,9 +852,10 @@ impl Engine {
         config: &SiftExtractor,
         image: &GrayImage,
     ) -> Result<ScaleSpaceFeatures<U8Descriptor>, RunError> {
-        let mut scratch = self.lock_scratch()?;
-        let detection = self.detect_features(config, image, &mut scratch, true)?;
-        self.describe_u8(config, &detection, &mut scratch)
+        self.run(|scratch| {
+            let detection = self.detect_features(config, image, scratch, true)?;
+            self.describe_u8(config, &detection, scratch)
+        })
     }
 
     /// Queue the image upload and return the source buffer and whether it
@@ -2447,8 +2607,14 @@ fn read_buffers_with<R>(
         let _ = sender.send(result);
     });
     device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map_err(|error| RunError::Readback(format!("{error:?}")))?;
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(SiftGpuExtractor::TIMEOUT),
+        })
+        .map_err(|error| match error {
+            wgpu::PollError::Timeout => RunError::Fault(Fault::Timeout),
+            other => RunError::Readback(other.to_string()),
+        })?;
     receiver
         .recv()
         .map_err(|error| RunError::Readback(error.to_string()))?
@@ -2790,6 +2956,8 @@ enum RunError {
     Capacity { what: &'static str },
     #[error("GPU SIFT readback failed: {0}")]
     Readback(String),
+    #[error("GPU SIFT device error: {0:?}")]
+    Fault(Fault),
 }
 
 impl From<RunError> for SiftGpuError {
@@ -2797,6 +2965,12 @@ impl From<RunError> for SiftGpuError {
         match error {
             RunError::Capacity { what } => Self::Capacity { what },
             RunError::Readback(message) => Self::Readback(message),
+            RunError::Fault(Fault::OutOfMemory) => Self::OutOfMemory,
+            RunError::Fault(Fault::Validation(message)) => Self::Validation(message),
+            RunError::Fault(Fault::Lost(message)) => Self::DeviceLost(message),
+            RunError::Fault(Fault::Timeout) => Self::Timeout {
+                timeout: SiftGpuExtractor::TIMEOUT,
+            },
         }
     }
 }
@@ -3075,6 +3249,83 @@ mod tests {
         assert!(!packed.keypoints().is_empty());
         assert_eq!(packed.keypoints(), float.keypoints());
         assert_eq!(packed.descriptors(), float.descriptors());
+    }
+
+    #[test]
+    fn gpu_validation_error_is_returned_and_recovers() {
+        let Some(gpu) = gpu_or_skip(SiftPreset::Normal) else {
+            return;
+        };
+        let image = integer_blobs(128);
+        let expected = match gpu.extract_u8(&image) {
+            Ok(features) => features,
+            Err(error) => panic!("GPU extraction failed: {error}"),
+        };
+        // MAP_READ only combines with COPY_DST, so this buffer is a
+        // validation error that wgpu reports through its error handler.
+        let _invalid = gpu.engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("invalid"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        assert!(matches!(
+            gpu.extract_u8(&image),
+            Err(SiftGpuError::Validation(_))
+        ));
+        let recovered = match gpu.extract_u8(&image) {
+            Ok(features) => features,
+            Err(error) => panic!("the extractor did not recover: {error}"),
+        };
+        assert_eq!(recovered.keypoints(), expected.keypoints());
+        assert_eq!(recovered.descriptors(), expected.descriptors());
+    }
+
+    #[test]
+    fn gpu_lost_device_fails_every_later_call() {
+        let Some(gpu) = gpu_or_skip(SiftPreset::Normal) else {
+            return;
+        };
+        let image = integer_blobs(128);
+        gpu.engine.device.destroy();
+        for _ in 0..2 {
+            assert!(matches!(
+                gpu.extract_u8(&image),
+                Err(SiftGpuError::DeviceLost(_))
+            ));
+        }
+        assert!(matches!(
+            gpu.detect_keypoints(&image),
+            Err(SiftGpuError::DeviceLost(_))
+        ));
+    }
+
+    #[test]
+    fn gpu_poisoned_scratch_is_rebuilt() {
+        let Some(gpu) = gpu_or_skip(SiftPreset::Normal) else {
+            return;
+        };
+        let image = integer_blobs(128);
+        let expected = match gpu.extract_u8(&image) {
+            Ok(features) => features,
+            Err(error) => panic!("GPU extraction failed: {error}"),
+        };
+        let poisoned = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _scratch = gpu.engine.scratch.lock();
+                    panic!("poison the scratch lock");
+                })
+                .join()
+        });
+        assert!(poisoned.is_err() && gpu.engine.scratch.is_poisoned());
+        let features = match gpu.extract_u8(&image) {
+            Ok(features) => features,
+            Err(error) => panic!("a poisoned scratch lock must be recovered: {error}"),
+        };
+        assert!(!gpu.engine.scratch.is_poisoned());
+        assert_eq!(features.keypoints(), expected.keypoints());
+        assert_eq!(features.descriptors(), expected.descriptors());
     }
 
     #[test]
