@@ -2067,6 +2067,7 @@ impl Engine {
     fn encode_init(
         &self,
         encoder: &mut Recorder,
+
         params: &mut ParamArena,
         source: &wgpu::Buffer,
         destination: &wgpu::Buffer,
@@ -2669,19 +2670,26 @@ fn read_buffers_with<R>(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(SiftGpuExtractor::TIMEOUT),
-        })
-        .map_err(|error| match error {
-            wgpu::PollError::Timeout => RunError::Fault(Fault::Timeout),
-            other => RunError::Readback(other.to_string()),
-        })?;
-    receiver
-        .recv()
-        .map_err(|error| RunError::Readback(error.to_string()))?
-        .map_err(|error| RunError::Readback(format!("{error:?}")))?;
+    let deadline = std::time::Instant::now() + SiftGpuExtractor::TIMEOUT;
+    let map_result = loop {
+        device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| RunError::Readback(error.to_string()))?;
+        match receiver.try_recv() {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(RunError::Readback(
+                    "mapping callback disconnected".to_string(),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(RunError::Fault(Fault::Timeout));
+        }
+        std::thread::yield_now();
+    };
+    map_result.map_err(|error| RunError::Readback(format!("{error:?}")))?;
     let result = {
         let data = slice
             .get_mapped_range()
