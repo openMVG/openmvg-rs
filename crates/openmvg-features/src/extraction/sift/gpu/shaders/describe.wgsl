@@ -45,8 +45,12 @@ struct DescKey {
 @group(0) @binding(2) var<storage, read> keys: array<DescKey>;
 @group(0) @binding(3) var<storage, read_write> out: array<u32>;
 @group(0) @binding(4) var<storage, read_write> valid: array<u32>;
+// `header[0]` of `oriented.wgsl`: the keys actually written. The grid is sized
+// for the host's bound `key_count`, which caps it.
+@group(0) @binding(5) var<storage, read> header: array<u32>;
 
 var<workgroup> hist: array<f32, 128>;
+var<workgroup> key_limit: u32;
 
 fn quantize_byte(value: f32) -> u32 {
     if (!(value > -3.0e38) || !(value < 3.0e38)) {
@@ -101,7 +105,12 @@ fn main(
 ) {
     // `workgroup_grid` folds more than 65535 keypoints into a second dimension.
     let id = wid.x + wid.y * 65535u;
-    if (id >= p.key_count) {
+    // Share the storage load through workgroup memory so the early return
+    // keeps the barrier below in uniform control flow.
+    if (lid.x == 0u) {
+        key_limit = min(p.key_count, header[0]);
+    }
+    if (id >= workgroupUniformLoad(&key_limit)) {
         return;
     }
     let tid = lid.x;

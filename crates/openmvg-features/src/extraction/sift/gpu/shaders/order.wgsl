@@ -22,6 +22,11 @@
 // reached it. Every decision is a pure function of the data, so the output is
 // deterministic.
 //
+// The number of refined samples is only known on the device: every kernel
+// reads it from `count` and clamps it to the host's bound `n`, which sizes
+// the buffers. `work[1]` is set when the count exceeds the bound, so the host
+// can grow the buffers and run the image again.
+//
 // All scratch arrays share one `work` buffer at the offsets in `OrderParams`;
 // `work[0]` receives the number of kept features.
 
@@ -89,8 +94,17 @@ const SCAN_TILE: u32 = 1024u; // SCAN_THREADS * 4
 @group(0) @binding(2) var<storage, read_write> work: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> features: array<Feature>;
 @group(0) @binding(4) var<storage, read_write> keys: array<OriKey>;
+@group(0) @binding(5) var<storage, read> count: array<u32>;
 
 var<workgroup> partial: array<u32, 256>;
+var<workgroup> scan_length: u32;
+
+const SCAN_LIVE: u32 = 0xffffffffu;
+
+// Refined samples to process: the device count, clamped to the bound.
+fn live() -> u32 {
+    return min(count[0], p.n);
+}
 
 fn bucket_of(r: Refined) -> u32 {
     return (r.orig_level - 1u) * p.rows + u32(r.orig_j);
@@ -111,26 +125,35 @@ fn hist(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let id = item(gid, nwg);
-    if (id >= p.n) {
+    if (id == 0u && count[0] > p.n) {
+        atomicStore(&work[1], 1u);
+    }
+    if (id >= live()) {
         return;
     }
     atomicAdd(&work[p.off_count + bucket_of(refined[id])], 1u);
 }
 
-// Exclusive prefix sum of `scan_len` words at `scan_src` into `scan_dst`
-// (and `scan_copy` unless NO_COPY), with the total in `work[0]` when
+// Exclusive prefix sum of `scan_len` words (the live sample count for
+// SCAN_LIVE) at `scan_src` into `scan_dst` (and `scan_copy` unless NO_COPY), with the total in `work[0]` when
 // `scan_copy == NO_COPY`. One workgroup walks the array in tiles of
 // SCAN_TILE words; each invocation owns four consecutive words of a tile.
 // Integer sums do not depend on the order, so the result is exact.
 @compute @workgroup_size(256, 1, 1)
 fn scan(@builtin(local_invocation_id) lid: vec3<u32>) {
     let tid = lid.x;
+    // A storage load is not uniform for WGSL; share the length through
+    // workgroup memory so the loop barriers stay in uniform control flow.
+    if (tid == 0u) {
+        scan_length = select(p.scan_len, live(), p.scan_len == SCAN_LIVE);
+    }
+    let total_len = workgroupUniformLoad(&scan_length);
     var carry = 0u;
-    for (var base = 0u; base < p.scan_len; base += SCAN_TILE) {
+    for (var base = 0u; base < total_len; base += SCAN_TILE) {
         var values = vec4<u32>(0u);
         for (var k = 0u; k < 4u; k += 1u) {
             let index = base + tid * 4u + k;
-            if (index < p.scan_len) {
+            if (index < total_len) {
                 values[k] = atomicLoad(&work[p.scan_src + index]);
             }
         }
@@ -150,7 +173,7 @@ fn scan(@builtin(local_invocation_id) lid: vec3<u32>) {
         var running = carry + partial[tid] - sum;
         for (var k = 0u; k < 4u; k += 1u) {
             let index = base + tid * 4u + k;
-            if (index < p.scan_len) {
+            if (index < total_len) {
                 atomicStore(&work[p.scan_dst + index], running);
                 if (p.scan_copy != NO_COPY) {
                     atomicStore(&work[p.scan_copy + index], running);
@@ -172,7 +195,7 @@ fn scatter(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let id = item(gid, nwg);
-    if (id >= p.n) {
+    if (id >= live()) {
         return;
     }
     let slot = atomicAdd(&work[p.off_cursor + bucket_of(refined[id])], 1u);
@@ -223,7 +246,7 @@ fn hash_insert(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let rank = item(gid, nwg);
-    if (rank >= p.n) {
+    if (rank >= live()) {
         return;
     }
     let sample = target_of(refined[atomicLoad(&work[p.off_sorted + rank])]);
@@ -249,7 +272,7 @@ fn flag(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let rank = item(gid, nwg);
-    if (rank >= p.n) {
+    if (rank >= live()) {
         return;
     }
     let record = refined[atomicLoad(&work[p.off_sorted + rank])];
@@ -264,7 +287,7 @@ fn emit(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let rank = item(gid, nwg);
-    if (rank >= p.n || atomicLoad(&work[p.off_kept + rank]) == 0u) {
+    if (rank >= live() || atomicLoad(&work[p.off_kept + rank]) == 0u) {
         return;
     }
     let record = refined[atomicLoad(&work[p.off_sorted + rank])];
