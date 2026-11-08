@@ -48,6 +48,7 @@ the stable API of `openmvg-sfm` and `openmvg-io`, so a library user can reproduc
 | `--detector alp` (default), `sift`; `--matcher hnsw` (default), `brute-force` | Feature detector and descriptor matcher |
 | `--density` (both detectors; `ultra` is SIFT only), `--max-dimension`, `--max-pairs-per-view`, `--no-radial-calibration` | The front-end settings of `openmvg_sfm::Frontend` |
 | `--seed` | Deterministic seed; the same inputs and seed give the same reconstruction |
+| `--control-points FILE` | Points of known geometry (marker corners, scale bars, surveyed points) and their pixel observations: the outputs are scaled to their unit, or registered into the frame of their reference group, and `control_points_report.json` gives the residuals |
 | `--output DIR`, `--colmap`, `--no-progress` | Output directory (default `images/sfm_output`), COLMAP text model, progress bars |
 
 The output directory receives `reconstruction.ply`, `reconstruction.omvg` (an OMVG dataset folder

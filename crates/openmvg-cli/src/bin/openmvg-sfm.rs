@@ -28,6 +28,7 @@ use clap::{Parser, ValueEnum};
 use openmvg_core::camera::CameraModelType;
 use openmvg_io::WriteOptions;
 use openmvg_sfm::config::{GlobalSfmConfig, IncrementalSfmConfig};
+use openmvg_sfm::control_points::{ControlPoints, register_control_points};
 use openmvg_sfm::image::{
     ImageDatasetConfig, ImageIntrinsicPolicy, ImageProject, discover_dataset_images,
     find_calibration_file, image_size, load_pinhole_intrinsics_matrix, prepare_image_paths,
@@ -134,6 +135,13 @@ struct Cli {
     /// get it).
     #[arg(long)]
     no_radial_calibration: bool,
+
+    /// Control points (JSON): groups of points with known coordinates, such as marker corners,
+    /// and their pixel observations by image name. The reconstruction is scaled to their unit,
+    /// or registered into the frame of their reference group, before it is written, and
+    /// `control_points_report.json` gives the residuals.
+    #[arg(long, value_name = "FILE")]
+    control_points: Option<PathBuf>,
 
     /// Also write the reconstruction as a COLMAP text model under `colmap/sparse/0`.
     #[arg(long)]
@@ -468,6 +476,22 @@ fn run(cli: Cli) -> DynResult<()> {
     let (reconstruction, run_report) = output.into_parts();
     let final_route = run_report.final_route();
     let has_reconstruction = run_report.has_reconstruction();
+    let control_points = match &cli.control_points {
+        Some(file) => Some(serde_json::from_str::<ControlPoints>(
+            &std::fs::read_to_string(file)?,
+        )?),
+        None => None,
+    };
+    let (reconstruction, control_report) = match (&control_points, has_reconstruction) {
+        (Some(control), true) => {
+            let registration = register_control_points(&reconstruction, control)?;
+            (
+                reconstruction.transformed(&registration.similarity)?,
+                Some(registration.report),
+            )
+        }
+        _ => (reconstruction, None),
+    };
 
     let output_dir = cli
         .output
@@ -512,6 +536,12 @@ fn run(cli: Cli) -> DynResult<()> {
     };
     write_json(&output_dir.join("sfm_report.json"), &report)?;
     write_json(&output_dir.join("intrinsic_report.json"), &intrinsic_report)?;
+    if let Some(control_report) = &control_report {
+        write_json(
+            &output_dir.join("control_points_report.json"),
+            control_report,
+        )?;
+    }
 
     if !has_reconstruction {
         return Err(format!(
@@ -531,6 +561,26 @@ fn run(cli: Cli) -> DynResult<()> {
         reconstruction_seconds,
     );
     print_intrinsics(&reconstruction, &input_cameras, self_calibrate);
+    if let Some(control_report) = &control_report {
+        let unit = control_report.unit.as_deref().unwrap_or("control units");
+        let fitted = control_report
+            .groups
+            .iter()
+            .filter(|group| group.scale.is_some())
+            .count();
+        let spread = control_report
+            .group_scale_spread
+            .map_or(String::new(), |spread| {
+                format!(", group scales spread {:.3}%", 100.0 * spread)
+            });
+        println!(
+            "control points: {fitted}/{} groups, scale {:.6} {unit} per model unit, rms residual \
+             {:.4} {unit}{spread}",
+            control_report.groups.len(),
+            control_report.scale,
+            control_report.rms_residual,
+        );
+    }
     println!("PLY: {}", output_dir.join("reconstruction.ply").display());
     println!(
         "OMVG (0.1-draft format, may change before 1.0): {}",
