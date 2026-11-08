@@ -1585,8 +1585,14 @@ impl Engine {
             &mut scratch.staging,
             &ranges,
             |data, offsets| {
-                let mut features = Vec::new();
-                let mut described = describe.map(|_| ScaleSpaceFeatures::default());
+                let total: usize = counts.iter().map(|&(_, _, written, _)| written).sum();
+                let mut features = Vec::with_capacity(total);
+                let mut described = describe.map(|_| {
+                    let mut out = ScaleSpaceFeatures::default();
+                    out.keypoints.reserve(total);
+                    out.descriptors.reserve(total);
+                    out
+                });
                 for (octave, (offsets, &(_, _, written, _))) in
                     offsets.chunks(per_octave).zip(&counts).enumerate()
                 {
