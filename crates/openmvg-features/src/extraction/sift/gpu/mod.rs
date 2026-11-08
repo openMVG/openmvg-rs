@@ -30,6 +30,14 @@
 //! `extract_u8_batch` takes an iterator of images and pipelines it over two
 //! sets of scratch buffers: one image is uploaded and recorded, and the
 //! previous one decoded, while the device works.
+//!
+//! Device memory is about 89 bytes per input pixel for `first_octave = 0`
+//! and four times that for `first_octave = -1` (Ultra), almost all of it the
+//! first octave's scale space; a batch holds two sets. The largest image is
+//! bounded by the device's largest storage binding, which must hold the
+//! first octave's Gaussian levels: `4 * (num_scales + 3)` bytes per pixel of
+//! that octave, 24 bytes per input pixel for the presets (96 for Ultra). The
+//! crate README lists the measured requirements and limits.
 //! Without a feature budget, an extraction is one submit followed by two
 //! readbacks: the counters, which also wait for the work, and then exactly the
 //! oriented features and descriptors that exist. Device-to-host transfers are

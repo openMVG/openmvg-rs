@@ -223,48 +223,49 @@ fn device_memory_mib() -> Option<f64> {
 fn memory_sweep(image: &GrayImage, preset: SiftPreset) {
     const MIB: f64 = 1024.0 * 1024.0;
     println!(
-        "| Size | Megapixels | Features | Resident buffers (MiB) | Bytes per input pixel | Device memory added (MiB) | First call (ms) |"
+        "| Size | Megapixels | Features | extract_u8 resident (MiB) | Bytes per input pixel | \
+         extract_u8 device memory added (MiB) | extract_u8_batch resident (MiB) | \
+         extract_u8_batch device memory added (MiB) |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|");
-    for scale in [0.25f32, 0.5, 0.75, 1.0, 1.5, 2.0] {
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|");
+    for scale in [0.25f32, 0.5, 1.0, 2.0, 3.5, 4.0] {
         let image = resize(image, scale);
         let pixels = image.len() as f64;
-        let before = device_memory_mib();
-        let gpu = match SiftGpuExtractor::with_preset(preset) {
-            Ok(gpu) => gpu,
-            Err(error) => {
-                eprintln!("GPU extractor unavailable: {error}; skipping");
-                return;
+        let size = format!("{}x{} | {:.1}", image.ncols(), image.nrows(), pixels / 1e6);
+        // A fresh extractor per mode, so each column is that mode alone.
+        let measure = |batch: bool| {
+            let before = device_memory_mib();
+            let gpu = SiftGpuExtractor::with_preset(preset).map_err(|error| error.to_string())?;
+            let features = if batch {
+                let mut results = gpu.extract_u8_batch([&image, &image]);
+                results.pop().unwrap_or_else(|| Ok(Default::default()))
+            } else {
+                gpu.extract_u8(&image)
             }
+            .map_err(|error| error.to_string())?;
+            let added = before
+                .zip(device_memory_mib())
+                .map(|(before, after)| after - before);
+            Ok::<_, String>((
+                features.keypoints().len(),
+                gpu.resident_bytes() as f64,
+                added,
+            ))
         };
-        let start = Instant::now();
-        let features = match gpu.extract_u8(&image) {
-            Ok(features) => features,
-            Err(error) => {
-                println!(
-                    "| {}x{} | {:.1} | {error} | | | | |",
-                    image.ncols(),
-                    image.nrows(),
-                    pixels / 1e6
-                );
-                continue;
-            }
+        let format_added = |added: Option<f64>| {
+            added.map_or_else(|| "n/a".to_string(), |added| format!("{added:.0}"))
         };
-        let elapsed = ms(start);
-        let resident = gpu.resident_bytes() as f64;
-        let added = before
-            .zip(device_memory_mib())
-            .map(|(before, after)| after - before);
-        println!(
-            "| {}x{} | {:.1} | {} | {:.0} | {:.0} | {} | {elapsed:.1} |",
-            image.ncols(),
-            image.nrows(),
-            pixels / 1e6,
-            features.keypoints().len(),
-            resident / MIB,
-            resident / pixels,
-            added.map_or_else(|| "n/a".to_string(), |added| format!("{added:.0}")),
-        );
+        match (measure(false), measure(true)) {
+            (Ok((features, single, single_added)), Ok((_, batch, batch_added))) => println!(
+                "| {size} | {features} | {:.0} | {:.0} | {} | {:.0} | {} |",
+                single / MIB,
+                single / pixels,
+                format_added(single_added),
+                batch / MIB,
+                format_added(batch_added),
+            ),
+            (Err(error), _) | (_, Err(error)) => println!("| {size} | {error} | | | | | |"),
+        }
     }
 }
 
