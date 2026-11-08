@@ -64,11 +64,6 @@ Create one extractor per device and reuse it for a batch: its scratch buffers st
 grow only when an image needs more space, so alternating image sizes do not reallocate them.
 It is opt-in: default builds stay CPU-only and `no_std + alloc` builds are unchanged.
 
-The conservative separable blur path is used by default. For Vulkan devices where
-benchmarking shows it to help, enable the experimental fused blur path with
-`gpu-fused-blur`. It may regress performance on Metal devices and is therefore
-not enabled by default.
-
 ## License
 
 Licensed under either Apache-2.0 or MIT. See the repository license files.

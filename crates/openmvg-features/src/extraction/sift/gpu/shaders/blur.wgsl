@@ -20,7 +20,7 @@ struct BlurParams {
     vertical: u32,
     dog: u32,
     dog_off: u32,
-    _in_place: u32,
+    _pad0: u32,
     _pad1: u32,
     _pad2: u32,
 };

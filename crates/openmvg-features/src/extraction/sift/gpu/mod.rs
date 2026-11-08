@@ -4,7 +4,7 @@
 //! Optional wgpu backend for the classic SIFT extractor.
 //!
 //! ```text
-//!  image ──pack u8──> init ──> blur + DoG (fused, per level) ──> extrema ──> refine
+//!  image ──pack u8──> init ──> blur (+ DoG in its second pass) ──> extrema ──> refine
 //!                                                                              │ counts
 //!  host <── features, orientation counts, first peaks <── orientation <── order + dedup
 //!   │ budget, offsets
@@ -67,10 +67,6 @@ const REFINE_WORKGROUPS: u32 = 256;
 /// `NO_COPY` in `order.wgsl`.
 const ORDER_NO_COPY: u32 = u32::MAX;
 const ORDERED_FEATURE_BYTES: usize = core::mem::size_of::<GpuFeature>();
-/// `MAX_RADIUS`, `TILE` and `BLOCK_COLS` in `blur_fused.wgsl`.
-const FUSED_BLUR_MAX_RADIUS: usize = 16;
-const FUSED_BLUR_ROWS: u32 = 32;
-const FUSED_BLUR_COLS: u32 = 64;
 const PACKED_DESCR_WORDS: usize = SIFT_DESCR_SIZE / 4;
 
 // =============================================================================
@@ -665,7 +661,6 @@ impl Scratch {
 struct Engine {
     _instance: wgpu::Instance,
     device: wgpu::Device,
-    use_fused_blur: bool,
     queue: wgpu::Queue,
     pipelines: Pipelines,
     layouts: Layouts,
@@ -753,7 +748,6 @@ struct Layouts {
 struct Pipelines {
     init: wgpu::ComputePipeline,
     blur: wgpu::ComputePipeline,
-    blur_fused: wgpu::ComputePipeline,
     decimate: wgpu::ComputePipeline,
     extrema: wgpu::ComputePipeline,
     refine: wgpu::ComputePipeline,
@@ -787,7 +781,6 @@ impl Engine {
             apply_limit_buckets: false,
         }))
         .map_err(|_| SiftGpuError::NoAdapter)?;
-        let use_fused_blur = cfg!(feature = "gpu-fused-blur");
         let limits = adapter.limits();
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -821,7 +814,6 @@ impl Engine {
         Ok(Self {
             _instance: instance,
             device,
-            use_fused_blur,
             queue,
             pipelines,
             layouts,
@@ -2087,10 +2079,8 @@ impl Engine {
         );
     }
 
-    /// Separable blur of one plane. Kernels up to `FUSED_BLUR_MAX_RADIUS`
-    /// run both passes in one tiled dispatch (`blur_fused.wgsl`); larger ones
-    /// run two passes: `source` into `temp` along rows, then `temp` into
-    /// `destination` across columns. The destination may be the
+    /// Separable blur of one plane in two passes: `source` into `temp` along
+    /// rows, then `temp` into `destination` across columns. The destination may be the
     /// same buffer as `source` at another plane; the passes are ordered. With
     /// `dog_offset`, the second pass also writes the DoG plane (this level
     /// minus the source level) into `dog`.
@@ -2102,43 +2092,6 @@ impl Engine {
         pair: BlurPair<'_>,
     ) {
         let (weights, radius) = weights;
-        if self.use_fused_blur && *radius <= FUSED_BLUR_MAX_RADIUS {
-            let in_place = pair.source == pair.destination;
-            let bind_group = self.bind(
-                params,
-                &self.layouts.blur,
-                &BlurParams {
-                    rows_cols: [pair.rows as u32, pair.cols as u32],
-                    src_off: pair.source_offset as u32,
-                    dst_off: pair.destination_offset as u32,
-                    radius: *radius as u32,
-                    wt_off: 0,
-                    vertical: 0,
-                    dog: u32::from(pair.dog_offset.is_some()),
-                    dog_off: pair.dog_offset.unwrap_or(0) as u32,
-                    in_place: u32::from(in_place),
-                    pad: [0; 2],
-                },
-                &[
-                    if in_place { pair.temp } else { pair.source },
-                    pair.destination,
-                    weights,
-                    pair.dog,
-                ],
-            );
-            self.dispatch(
-                encoder,
-                "omvg-sift-blur-fused",
-                &self.pipelines.blur_fused,
-                &bind_group,
-                [
-                    (pair.rows as u32).div_ceil(FUSED_BLUR_ROWS),
-                    (pair.cols as u32).div_ceil(FUSED_BLUR_COLS),
-                    1,
-                ],
-            );
-            return;
-        }
         let workgroups = [
             (pair.rows as u32).div_ceil(16),
             (pair.cols as u32).div_ceil(16),
@@ -2156,8 +2109,7 @@ impl Engine {
                 vertical: 1,
                 dog: 0,
                 dog_off: 0,
-                in_place: 0,
-                pad: [0; 2],
+                pad: [0; 3],
             },
             &[pair.source, pair.temp, weights, pair.dog],
         );
@@ -2180,8 +2132,7 @@ impl Engine {
                 vertical: 0,
                 dog: u32::from(pair.dog_offset.is_some()),
                 dog_off: pair.dog_offset.unwrap_or(0) as u32,
-                in_place: 0,
-                pad: [0; 2],
+                pad: [0; 3],
             },
             &[pair.temp, pair.destination, weights, pair.dog],
         );
@@ -2454,12 +2405,6 @@ impl Pipelines {
                 "omvg-sift-blur",
                 layouts.blur.clone(),
                 include_str!("shaders/blur.wgsl"),
-            ),
-            blur_fused: pipeline(
-                device,
-                "omvg-sift-blur-fused",
-                layouts.blur.clone(),
-                include_str!("shaders/blur_fused.wgsl"),
             ),
             decimate: pipeline(
                 device,
@@ -2864,8 +2809,7 @@ struct BlurParams {
     vertical: u32,
     dog: u32,
     dog_off: u32,
-    in_place: u32,
-    pad: [u32; 2],
+    pad: [u32; 3],
 }
 
 #[repr(C)]
