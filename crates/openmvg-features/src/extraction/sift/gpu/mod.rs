@@ -45,6 +45,10 @@
 //! the per-octave stages after refinement are recorded stage by stage, one
 //! command buffer each, so the octaves of a stage run concurrently.
 //!
+//! Setting `OMVG_SIFT_GPU_PROFILE` to `host`, `span` or `1` makes an extractor
+//! record host phases and GPU pass timestamps and print them when dropped; see
+//! the `profile` module.
+//!
 //! [`GrayImage`]: crate::extraction::GrayImage
 
 use std::collections::BTreeMap;
@@ -57,6 +61,8 @@ use crate::extraction::{
     DescriptorStorage, F32Descriptor, GrayImage, ScaleSpaceFeatures, ScaleSpaceKeypoint,
     U8Descriptor,
 };
+
+mod profile;
 
 use super::common::SIFT_DESCR_SIZE;
 use super::detector::SiftExtractor;
@@ -737,6 +743,7 @@ struct Engine {
     layouts: Layouts,
     scratch: Mutex<Scratch>,
     faults: Arc<Faults>,
+    profiler: Option<profile::Profiler>,
 }
 
 /// Device errors that wgpu reports through callbacks rather than return
@@ -854,10 +861,17 @@ impl Engine {
         }))
         .map_err(|_| SiftGpuError::NoAdapter)?;
         let limits = adapter.limits();
+        let profiling = profile::Profiler::requested();
+        let timestamps =
+            profiling == Some(true) && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("openmvg-sift-gpu"),
-                required_features: wgpu::Features::empty(),
+                required_features: if timestamps {
+                    wgpu::Features::TIMESTAMP_QUERY
+                } else {
+                    wgpu::Features::empty()
+                },
                 required_limits: limits,
                 ..Default::default()
             }))?;
@@ -883,6 +897,7 @@ impl Engine {
         if let Some(fault) = faults.take() {
             return Err(RunError::Fault(fault).into());
         }
+        let profiler = profiling.map(|_| profile::Profiler::new(&device, &queue, timestamps));
         Ok(Self {
             _instance: instance,
             device,
@@ -891,6 +906,7 @@ impl Engine {
             layouts,
             scratch: Mutex::new(Scratch::default()),
             faults,
+            profiler,
         })
     }
 
@@ -911,7 +927,14 @@ impl Engine {
             return Err(RunError::Fault(fault));
         }
         let mut scratch = self.lock_scratch();
+        if let Some(profiler) = &self.profiler {
+            profiler.begin();
+        }
         let result = body(&mut scratch);
+        self.mark("z decode and assemble");
+        if let Some(profiler) = &self.profiler {
+            profiler.finish(&self.device, &self.queue);
+        }
         let fault = match (self.faults.take(), &result) {
             (Some(fault), _) => Some(fault),
             (None, Err(RunError::Fault(fault))) => Some(fault.clone()),
@@ -925,6 +948,18 @@ impl Engine {
             self.faults.set_fatal(fault.clone());
         }
         Err(RunError::Fault(fault))
+    }
+
+    fn ts(&self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        self.profiler
+            .as_ref()
+            .and_then(|profiler| profiler.pass(label))
+    }
+
+    fn mark(&self, label: &'static str) {
+        if let Some(profiler) = &self.profiler {
+            profiler.mark(label);
+        }
     }
 
     fn lock_scratch(&self) -> MutexGuard<'_, Scratch> {
@@ -1261,7 +1296,9 @@ impl Engine {
             capacities.push(capacity);
         }
 
+        self.mark("a setup");
         let (source, packed) = self.upload_image(image, scratch)?;
+        self.mark("b pack and upload");
 
         let mut encoder = Recorder::new(&self.device, "omvg-sift-scale-space");
         scratch.params.reset();
@@ -1525,6 +1562,7 @@ impl Engine {
         drop(chains);
         scratch.params.flush(&self.queue);
         self.queue.submit(command_buffers);
+        self.mark("c encode and submit");
 
         // First read the counters, which waits for the whole submit, then
         // read exactly the oriented features and descriptors that exist:
@@ -1558,6 +1596,7 @@ impl Engine {
                     .collect::<Vec<_>>()
             },
         )?;
+        self.mark("d wait for counts (whole submit)");
         let mut truncated = false;
         for (octave, &(candidates, refined, _, oriented_total)) in counts.iter().enumerate() {
             if candidates > capacities[octave] || refined > capacities[octave] {
@@ -1579,12 +1618,14 @@ impl Engine {
             }
         }
         let per_octave = if describe.is_some() { 3 } else { 1 };
+        self.mark("e prepare data readback");
         let (features, described) = read_buffers_with(
             &self.device,
             &self.queue,
             &mut scratch.staging,
             &ranges,
             |data, offsets| {
+                self.mark("f wait for data readback");
                 let total: usize = counts.iter().map(|&(_, _, written, _)| written).sum();
                 let mut features = Vec::with_capacity(total);
                 let mut described = describe.map(|_| {
@@ -2251,12 +2292,19 @@ impl Engine {
         bind_group: &wgpu::BindGroup,
         workgroups: [u32; 3],
     ) {
+        if self
+            .profiler
+            .as_ref()
+            .is_some_and(|profiler| profiler.split)
+        {
+            recorder.pass = None;
+        }
         let pass = recorder.pass.get_or_insert_with(|| {
             recorder
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some(label),
-                    timestamp_writes: None,
+                    timestamp_writes: self.ts(label),
                 })
                 .forget_lifetime()
         });

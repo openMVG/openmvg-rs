@@ -21,6 +21,9 @@
 //! directory writes the GPU features there; `OMVG_SIFT_BENCH_REF` compares the GPU features
 //! with such a dump, so a change can be checked for identical output.
 //!
+//! `OMVG_SIFT_GPU_PROFILE` (`host`, `span` or `1`) adds a stage profile of the GPU
+//! extractor to stderr.
+//!
 //! The report has three parts: per-image latency of the CPU extractor (which
 //! already parallelizes inside one image), CPU throughput with one image per
 //! Rayon worker, and GPU latency with one reused extractor. The parity section
