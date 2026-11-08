@@ -62,6 +62,9 @@ The GPU extractor accepts the same `SiftExtractor` configuration and returns the
 `ScaleSpaceFeatures`, with `detect_keypoints`, `extract_u8`, `extract_f32` and `extract_typed`.
 Create one extractor per device and reuse it for a batch: its scratch buffers stay resident and
 grow only when an image needs more space, so alternating image sizes do not reallocate them.
+For many images, `extract_u8_batch` takes an iterator of images, for example one that decodes
+the files of a folder, and overlaps the host work of each image with the GPU work of the previous
+one; it returns the same features as `extract_u8`, in input order.
 It is opt-in: default builds stay CPU-only and `no_std + alloc` builds are unchanged.
 
 ## License

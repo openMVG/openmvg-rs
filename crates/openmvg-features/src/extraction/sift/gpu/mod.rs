@@ -27,6 +27,9 @@
 //! One extractor is meant to be reused for a batch of images. Its scratch
 //! buffers stay resident and grow only when a later image needs more space,
 //! so repeated and alternating image sizes avoid per-image GPU allocation.
+//! `extract_u8_batch` takes an iterator of images and pipelines it over two
+//! sets of scratch buffers: one image is uploaded and recorded, and the
+//! previous one decoded, while the device works.
 //! Without a feature budget, an extraction is one submit followed by two
 //! readbacks: the counters, which also wait for the work, and then exactly the
 //! oriented features and descriptors that exist. Device-to-host transfers are
@@ -51,6 +54,7 @@
 //!
 //! [`GrayImage`]: crate::extraction::GrayImage
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -216,11 +220,13 @@ impl SiftGpuExtractor {
     /// Bytes of GPU memory the extractor keeps allocated between calls.
     ///
     /// Scratch buffers grow to the largest image processed so far and are
-    /// released when the extractor is dropped. The device and driver add
+    /// released when the extractor is dropped; [`Self::extract_u8_batch`]
+    /// keeps a second set. The device and driver add
     /// their own overhead on top.
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
         self.engine.lock_scratch().resident_bytes()
+            + lock_slot(&self.engine.batch_scratch).resident_bytes()
     }
 
     /// The detector configuration this extractor uses.
@@ -275,6 +281,47 @@ impl SiftGpuExtractor {
         self.engine
             .extract_u8(&self.config, image)
             .map_err(Into::into)
+    }
+
+    /// Detect and describe a sequence of images with u8 descriptors,
+    /// overlapping the host work of each image with the GPU work of the
+    /// previous one.
+    ///
+    /// Returns one result per image, in input order, each equal to what
+    /// [`Self::extract_u8`] returns for that image. Images are pulled from
+    /// `images` one ahead of the GPU, so an iterator that decodes the files of
+    /// a folder as it goes holds only a few images at a time:
+    ///
+    /// ```no_run
+    /// # use openmvg_features::extraction::{GrayImage, SiftGpuExtractor, SiftPreset};
+    /// # fn decode(path: &std::path::Path) -> GrayImage { GrayImage::zeros(64, 64) }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let extractor = SiftGpuExtractor::with_preset(SiftPreset::Normal)?;
+    /// let paths: Vec<std::path::PathBuf> = Vec::new();
+    /// for (path, features) in paths.iter().zip(extractor.extract_u8_batch(paths.iter().map(|p| decode(p)))) {
+    ///     println!("{}: {} features", path.display(), features?.keypoints().len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A batch keeps a second set of scratch buffers, so it needs up to twice
+    /// the device memory of single extractions. With a feature budget the
+    /// host selects between detection and description, and the images are
+    /// extracted one after another.
+    pub fn extract_u8_batch<I>(
+        &self,
+        images: I,
+    ) -> Vec<Result<ScaleSpaceFeatures<U8Descriptor>, SiftGpuError>>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<GrayImage>,
+    {
+        self.engine
+            .extract_u8_batch(&self.config, images)
+            .into_iter()
+            .map(|result| result.map_err(Into::into))
+            .collect()
     }
 
     /// Detect and describe with the descriptor storage `D`.
@@ -363,6 +410,86 @@ struct Pass<D> {
     /// header buffer whose first word holds that count on the GPU.
     compact: Vec<(usize, wgpu::Buffer, wgpu::Buffer)>,
     described: Option<ScaleSpaceFeatures<D>>,
+}
+
+/// Give `slots[target]` the larger of both slots' bounds, so a batch learns
+/// the feature counts once rather than once per slot.
+fn share_bounds(slots: &mut [&mut Scratch; 2], target: usize) {
+    let [first, second] = slots;
+    let (to, from) = if target == 0 {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    if to.bounds.len() < from.bounds.len() {
+        to.bounds
+            .resize_with(from.bounds.len(), OctaveBounds::default);
+    }
+    for (to, from) in to.bounds.iter_mut().zip(&from.bounds) {
+        to.refined = to.refined.max(from.refined);
+        to.oriented = to.oriented.max(from.oriented);
+    }
+}
+
+fn lock_slot(slot: &Mutex<Scratch>) -> MutexGuard<'_, Scratch> {
+    slot.lock().unwrap_or_else(|poisoned| {
+        // A panic left the scratch in an unknown state; start over.
+        let mut scratch = poisoned.into_inner();
+        *scratch = Scratch::default();
+        slot.clear_poison();
+        scratch
+    })
+}
+
+/// A pass that was recorded or needs no GPU work.
+enum Prepared {
+    /// The image is too small to hold a feature.
+    Empty,
+    /// Commands to submit and the buffers to read back afterwards.
+    Recorded {
+        commands: Vec<wgpu::CommandBuffer>,
+        flight: InFlight,
+    },
+}
+
+/// One octave of a pass: its ordering, oriented and (when described)
+/// descriptor buffers, and the oriented bound they were sized for.
+type OctaveStage = (
+    OrderedOctave,
+    OrientedOctave,
+    Option<(wgpu::Buffer, wgpu::Buffer)>,
+    usize,
+);
+
+/// The buffers a submitted pass is read back from.
+struct InFlight {
+    octaves: Vec<Octave>,
+    capacities: Vec<usize>,
+    candidate_counts: Vec<wgpu::Buffer>,
+    refined_counts: Vec<wgpu::Buffer>,
+    stages: Vec<OctaveStage>,
+}
+
+/// One octave's counters after a pass.
+#[derive(Clone, Copy)]
+struct OctaveCounts {
+    candidates: usize,
+    refined: usize,
+    /// Oriented features written, at most the bound.
+    written: usize,
+    /// Oriented features found, which may exceed the bound.
+    oriented: usize,
+}
+
+impl<D> Pass<D> {
+    fn empty(describe: Describe<D>) -> Self {
+        Self {
+            features: Vec::new(),
+            octaves: Vec::new(),
+            compact: Vec::new(),
+            described: describe.map(|_| ScaleSpaceFeatures::default()),
+        }
+    }
 }
 
 /// GPU buffers of one octave after [`Engine::encode_order`]: `work[0]` holds
@@ -742,6 +869,9 @@ struct Engine {
     pipelines: Pipelines,
     layouts: Layouts,
     scratch: Mutex<Scratch>,
+    /// The second slot of a batch, so one image can be recorded while the
+    /// previous one runs.
+    batch_scratch: Mutex<Scratch>,
     faults: Arc<Faults>,
     profiler: Option<profile::Profiler>,
 }
@@ -905,6 +1035,7 @@ impl Engine {
             pipelines,
             layouts,
             scratch: Mutex::new(Scratch::default()),
+            batch_scratch: Mutex::new(Scratch::default()),
             faults,
             profiler,
         })
@@ -963,13 +1094,7 @@ impl Engine {
     }
 
     fn lock_scratch(&self) -> MutexGuard<'_, Scratch> {
-        self.scratch.lock().unwrap_or_else(|poisoned| {
-            // A panic left the scratch in an unknown state; start over.
-            let mut scratch = poisoned.into_inner();
-            *scratch = Scratch::default();
-            self.scratch.clear_poison();
-            scratch
-        })
+        lock_slot(&self.scratch)
     }
 
     fn ensure_storage_capacity(&self, bytes: usize) -> Result<(), RunError> {
@@ -1078,6 +1203,133 @@ impl Engine {
         self.describe(config, &detection, scratch, format, decode)
     }
 
+    /// Pipeline `images` over the two scratch slots; see
+    /// [`SiftGpuExtractor::extract_u8_batch`].
+    ///
+    /// For image `k` the order is: record `k + 1` while the device runs `k`,
+    /// read `k`'s counters, submit `k`'s data copy, submit `k + 1`, then
+    /// decode `k` while the device runs `k + 1`. The data copy is queued
+    /// before `k + 1`, so waiting for it never waits for `k + 1`.
+    fn extract_u8_batch<I>(
+        &self,
+        config: &SiftExtractor,
+        images: I,
+    ) -> Vec<Result<ScaleSpaceFeatures<U8Descriptor>, RunError>>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<GrayImage>,
+    {
+        let describe: Describe<U8Descriptor> = Some((DescriptorFormat::U8, decode_u8));
+        let mut images = images.into_iter();
+        let mut results = Vec::new();
+        let mut rest = Vec::new();
+        if config.feature_budget.is_unlimited() && self.faults.fatal().is_none() {
+            let mut first = self.lock_scratch();
+            let mut second = lock_slot(&self.batch_scratch);
+            let mut slots = [&mut *first, &mut *second];
+            let mut pending: Option<(I::Item, usize, InFlight)> = None;
+            let mut slot = 0;
+            loop {
+                // Record the next image while the device runs the pending one.
+                let next = images.next();
+                let input_done = next.is_none();
+                let mut commands = None;
+                let mut next_flight = None;
+                let mut next_result = None;
+                let mut next_item = None;
+                if let Some(image) = next {
+                    share_bounds(&mut slots, slot);
+                    match self.prepare_pass(config, image.borrow(), slots[slot], describe) {
+                        Ok(Prepared::Recorded {
+                            commands: recorded,
+                            flight,
+                        }) => {
+                            commands = Some(recorded);
+                            next_flight = Some((image, slot, flight));
+                        }
+                        Ok(Prepared::Empty) => {
+                            next_result = Some(Ok(ScaleSpaceFeatures::default()));
+                            next_item = Some(image);
+                        }
+                        Err(error) => {
+                            next_result = Some(Err(error));
+                            next_item = Some(image);
+                        }
+                    }
+                }
+                // Finish the pending image; this submits the next one as
+                // soon as the pending image's data copy is queued.
+                let mut finished = None;
+                if let Some((image, pending_slot, flight)) = pending.take() {
+                    let result = self.finish_batched(
+                        config,
+                        image.borrow(),
+                        &mut *slots[pending_slot],
+                        flight,
+                        &mut commands,
+                        describe,
+                    );
+                    finished = Some((image, result));
+                }
+                if let Some(commands) = commands.take() {
+                    self.queue.submit(commands);
+                }
+                if let Some(fault) = self.faults.take() {
+                    // The device reported an error, so the images in flight
+                    // are unreliable. Rebuild the slots and give those images
+                    // and the rest to the single-image path, which reports
+                    // the error for the image it meets first.
+                    self.faults.record(fault);
+                    *slots[0] = Scratch::default();
+                    *slots[1] = Scratch::default();
+                    rest.extend(finished.map(|(image, _)| image));
+                    rest.extend(next_flight.map(|(image, _, _)| image));
+                    rest.extend(next_item);
+                    break;
+                }
+                results.extend(finished.map(|(_, result)| result));
+                results.extend(next_result);
+                if let Some((image, next_slot, flight)) = next_flight {
+                    pending = Some((image, next_slot, flight));
+                    slot = 1 - next_slot;
+                }
+                if input_done && pending.is_none() {
+                    break;
+                }
+            }
+        }
+        // One image at a time: with a feature budget, after a device error,
+        // and for the images the pipeline did not finish.
+        for image in rest.into_iter().chain(images) {
+            results.push(self.extract_u8(config, image.borrow()));
+        }
+        results
+    }
+
+    /// Finish one pipelined image: read its counters, submit its data copy,
+    /// then `next` (the following image's commands), and decode. An image
+    /// that outgrew its bounds runs again on its own, before `next`.
+    fn finish_batched(
+        &self,
+        config: &SiftExtractor,
+        image: &GrayImage,
+        scratch: &mut Scratch,
+        flight: InFlight,
+        next: &mut Option<Vec<wgpu::CommandBuffer>>,
+        describe: Describe<U8Descriptor>,
+    ) -> Result<ScaleSpaceFeatures<U8Descriptor>, RunError> {
+        let Some(counts) = self.read_counts(&flight, scratch)? else {
+            let pass = self.detect_pass(config, image, scratch, describe)?;
+            return Ok(pass.described.unwrap_or_default());
+        };
+        let data = self.start_data(&flight, &counts, scratch, describe)?;
+        if let Some(commands) = next.take() {
+            self.queue.submit(commands);
+        }
+        let pass = self.finish_data(flight, counts, data, describe)?;
+        Ok(pass.described.unwrap_or_default())
+    }
+
     /// Run the detection pass, growing the per-octave bounds and running
     /// again when the device counts exceed them. That happens for the first
     /// images an extractor sees and when an image has many more features
@@ -1143,9 +1395,9 @@ impl Engine {
 
     /// One detection pass in a single submit: scale space, extrema,
     /// refinement, ordering and deduplication, orientation, compaction and,
-    /// with `describe`, the descriptors, then one readback. Returns `None`
-    /// when an octave outgrew its bounds; the bounds have grown and the
-    /// caller runs the pass again.
+    /// with `describe`, the descriptors, then the counters and exactly the
+    /// data they describe. Returns `None` when an octave outgrew its bounds;
+    /// the bounds have grown and the caller runs the pass again.
     fn detect_features<D>(
         &self,
         config: &SiftExtractor,
@@ -1153,15 +1405,35 @@ impl Engine {
         scratch: &mut Scratch,
         describe: Describe<D>,
     ) -> Result<Option<Pass<D>>, RunError> {
+        let flight = match self.prepare_pass(config, image, scratch, describe)? {
+            Prepared::Empty => return Ok(Some(Pass::empty(describe))),
+            Prepared::Recorded { commands, flight } => {
+                self.queue.submit(commands);
+                flight
+            }
+        };
+        self.mark("c encode and submit");
+        let Some(counts) = self.read_counts(&flight, scratch)? else {
+            return Ok(None);
+        };
+        let pending = self.start_data(&flight, &counts, scratch, describe)?;
+        self.finish_data(flight, counts, pending, describe)
+            .map(Some)
+    }
+
+    /// Record one detection pass and queue its uploads and parameter writes,
+    /// without submitting its commands.
+    fn prepare_pass<D>(
+        &self,
+        config: &SiftExtractor,
+        image: &GrayImage,
+        scratch: &mut Scratch,
+        describe: Describe<D>,
+    ) -> Result<Prepared, RunError> {
         let height = image.nrows();
         let width = image.ncols();
         if height < MIN_INPUT_DIMENSION || width < MIN_INPUT_DIMENSION {
-            return Ok(Some(Pass {
-                features: Vec::new(),
-                octaves: Vec::new(),
-                compact: Vec::new(),
-                described: describe.map(|_| ScaleSpaceFeatures::default()),
-            }));
+            return Ok(Prepared::Empty);
         }
 
         let first_octave = config.first_octave;
@@ -1561,17 +1833,33 @@ impl Engine {
         }
         drop(chains);
         scratch.params.flush(&self.queue);
-        self.queue.submit(command_buffers);
-        self.mark("c encode and submit");
+        Ok(Prepared::Recorded {
+            commands: command_buffers,
+            flight: InFlight {
+                octaves,
+                capacities,
+                candidate_counts,
+                refined_counts,
+                stages,
+            },
+        })
+    }
 
-        // First read the counters, which waits for the whole submit, then
-        // read exactly the oriented features and descriptors that exist:
-        // device-to-host transfers are slow enough that copying up to the
-        // bounds would cost more than this extra round trip.
-        let mut ranges = Vec::with_capacity(num_octaves * 4);
-        for (octave, (order, oriented, _, _)) in stages.iter().enumerate() {
-            ranges.push((&candidate_counts[octave], 4));
-            ranges.push((&refined_counts[octave], 4));
+    /// Read a submitted pass's counters, which waits for its work, and check
+    /// them against the bounds. Returns `None` when an octave outgrew its
+    /// bounds; the bounds have grown and the image must run again.
+    fn read_counts(
+        &self,
+        flight: &InFlight,
+        scratch: &mut Scratch,
+    ) -> Result<Option<Vec<OctaveCounts>>, RunError> {
+        // The counters wait for the whole submit; the data is then read in
+        // exact sizes: device-to-host transfers are slow enough that copying
+        // up to the bounds would cost more than this extra round trip.
+        let mut ranges = Vec::with_capacity(flight.stages.len() * 4);
+        for (octave, (order, oriented, _, _)) in flight.stages.iter().enumerate() {
+            ranges.push((&flight.candidate_counts[octave], 4));
+            ranges.push((&flight.refined_counts[octave], 4));
             ranges.push((&order.work, 8));
             ranges.push((&oriented.header, 12));
         }
@@ -1585,103 +1873,116 @@ impl Engine {
                     .as_chunks::<4>()
                     .0
                     .iter()
-                    .map(|offsets| {
-                        (
-                            read_u32(data, offsets[0]) as usize,
-                            read_u32(data, offsets[1]) as usize,
-                            read_u32(data, offsets[3]) as usize,
-                            read_u32(data, offsets[3] + 8) as usize,
-                        )
+                    .map(|offsets| OctaveCounts {
+                        candidates: read_u32(data, offsets[0]) as usize,
+                        refined: read_u32(data, offsets[1]) as usize,
+                        written: read_u32(data, offsets[3]) as usize,
+                        oriented: read_u32(data, offsets[3] + 8) as usize,
                     })
                     .collect::<Vec<_>>()
             },
         )?;
         self.mark("d wait for counts (whole submit)");
         let mut truncated = false;
-        for (octave, &(candidates, refined, _, oriented_total)) in counts.iter().enumerate() {
-            if candidates > capacities[octave] || refined > capacities[octave] {
+        for (octave, count) in counts.iter().enumerate() {
+            let capacity = flight.capacities[octave];
+            if count.candidates > capacity || count.refined > capacity {
                 return Err(RunError::Capacity { what: "candidate" });
             }
-            truncated |= scratch.bounds[octave].update(capacities[octave], refined, oriented_total);
+            truncated |= scratch.bounds[octave].update(capacity, count.refined, count.oriented);
         }
-        if truncated {
-            return Ok(None);
-        }
+        Ok((!truncated).then_some(counts))
+    }
 
+    /// Submit the copy of exactly the oriented features and, when
+    /// described, the descriptors that a pass produced.
+    fn start_data<D>(
+        &self,
+        flight: &InFlight,
+        counts: &[OctaveCounts],
+        scratch: &mut Scratch,
+        describe: Describe<D>,
+    ) -> Result<PendingReadback, RunError> {
         let descriptor_bytes = describe.map_or(0, |(format, _)| format.words_per_key() * 4);
-        let mut ranges = Vec::with_capacity(num_octaves * 3);
-        for ((_, oriented, described, _), &(_, _, written, _)) in stages.iter().zip(&counts) {
-            ranges.push((&oriented.records, written * ORIENTED_RECORD_BYTES));
+        let mut ranges = Vec::with_capacity(flight.stages.len() * 3);
+        for ((_, oriented, described, _), count) in flight.stages.iter().zip(counts) {
+            ranges.push((&oriented.records, count.written * ORIENTED_RECORD_BYTES));
             if let Some((valid, values)) = described {
-                ranges.push((valid, written * 4));
-                ranges.push((values, written * descriptor_bytes));
+                ranges.push((valid, count.written * 4));
+                ranges.push((values, count.written * descriptor_bytes));
             }
         }
-        let per_octave = if describe.is_some() { 3 } else { 1 };
         self.mark("e prepare data readback");
-        let (features, described) = read_buffers_with(
-            &self.device,
-            &self.queue,
-            &mut scratch.staging,
-            &ranges,
-            |data, offsets| {
-                self.mark("f wait for data readback");
-                let total: usize = counts.iter().map(|&(_, _, written, _)| written).sum();
-                let mut features = Vec::with_capacity(total);
-                let mut described = describe.map(|_| {
-                    let mut out = ScaleSpaceFeatures::default();
-                    out.keypoints.reserve(total);
-                    out.descriptors.reserve(total);
-                    out
-                });
-                for (octave, (offsets, &(_, _, written, _))) in
-                    offsets.chunks(per_octave).zip(&counts).enumerate()
+        start_readback(&self.device, &self.queue, &mut scratch.staging, &ranges)
+    }
+
+    /// Wait for a pass's data copy and decode its features, in detector
+    /// order, and its descriptors.
+    fn finish_data<D>(
+        &self,
+        flight: InFlight,
+        counts: Vec<OctaveCounts>,
+        pending: PendingReadback,
+        describe: Describe<D>,
+    ) -> Result<Pass<D>, RunError> {
+        let descriptor_bytes = describe.map_or(0, |(format, _)| format.words_per_key() * 4);
+        let per_octave = if describe.is_some() { 3 } else { 1 };
+        let (features, described) = pending.finish(&self.device, |data, offsets| {
+            self.mark("f wait for data readback");
+            let total: usize = counts.iter().map(|count| count.written).sum();
+            let mut features = Vec::with_capacity(total);
+            let mut described = describe.map(|_| {
+                let mut out = ScaleSpaceFeatures::default();
+                out.keypoints.reserve(total);
+                out.descriptors.reserve(total);
+                out
+            });
+            for (octave, (offsets, count)) in offsets.chunks(per_octave).zip(&counts).enumerate() {
+                let records = &data[offsets[0]..offsets[0] + count.written * ORIENTED_RECORD_BYTES];
+                for (local, record) in records
+                    .as_chunks::<ORIENTED_RECORD_BYTES>()
+                    .0
+                    .iter()
+                    .enumerate()
                 {
-                    let records = &data[offsets[0]..offsets[0] + written * ORIENTED_RECORD_BYTES];
-                    for (local, record) in records
-                        .as_chunks::<ORIENTED_RECORD_BYTES>()
-                        .0
-                        .iter()
-                        .enumerate()
-                    {
-                        let record = bytemuck::pod_read_unaligned::<GpuOrientedRecord>(record);
-                        let feature = Feature {
-                            x: record.x,
-                            y: record.y,
-                            sigma: record.sigma,
-                            orientation: record.orientation,
-                            peak: record.peak,
-                            octave,
-                            scale_index: record.level as usize,
-                        };
-                        features.push(feature);
-                        let (Some(out), Some((_, decode))) = (described.as_mut(), describe) else {
-                            continue;
-                        };
-                        if read_u32(data, offsets[1] + local * 4) == 0 {
-                            continue;
-                        }
-                        let start = offsets[2] + local * descriptor_bytes;
-                        if let Some(descriptor) = decode(&data[start..start + descriptor_bytes]) {
-                            out.keypoints.push(feature.geometry());
-                            out.descriptors.push(descriptor);
-                        }
+                    let record = bytemuck::pod_read_unaligned::<GpuOrientedRecord>(record);
+                    let feature = Feature {
+                        x: record.x,
+                        y: record.y,
+                        sigma: record.sigma,
+                        orientation: record.orientation,
+                        peak: record.peak,
+                        octave,
+                        scale_index: record.level as usize,
+                    };
+                    features.push(feature);
+                    let (Some(out), Some((_, decode))) = (described.as_mut(), describe) else {
+                        continue;
+                    };
+                    if read_u32(data, offsets[1] + local * 4) == 0 {
+                        continue;
+                    }
+                    let start = offsets[2] + local * descriptor_bytes;
+                    if let Some(descriptor) = decode(&data[start..start + descriptor_bytes]) {
+                        out.keypoints.push(feature.geometry());
+                        out.descriptors.push(descriptor);
                     }
                 }
-                (features, described)
-            },
-        )?;
-        let compact = stages
+            }
+            (features, described)
+        })?;
+        let compact = flight
+            .stages
             .into_iter()
             .zip(&counts)
-            .map(|((_, oriented, _, _), &(_, _, total, _))| (total, oriented.keys, oriented.header))
+            .map(|((_, oriented, _, _), count)| (count.written, oriented.keys, oriented.header))
             .collect();
-        Ok(Some(Pass {
+        Ok(Pass {
             features,
-            octaves,
+            octaves: flight.octaves,
             compact,
             described,
-        }))
+        })
     }
 
     /// Describe a budgeted detection in a second submit and readback.
@@ -2865,6 +3166,27 @@ fn read_buffers_with<R>(
     ranges: &[(&wgpu::Buffer, usize)],
     decode: impl FnOnce(&[u8], &[usize]) -> R,
 ) -> Result<R, RunError> {
+    start_readback(device, queue, staging_buffer, ranges)?.finish(device, decode)
+}
+
+/// A readback whose copy is submitted and whose mapping is pending. Work
+/// submitted after it does not delay it: the mapping only waits for the
+/// submission that holds the copy.
+struct PendingReadback {
+    staging: Option<wgpu::Buffer>,
+    total: u64,
+    offsets: Vec<usize>,
+    receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+/// Copy the leading `bytes` of each buffer into one staging buffer, submit
+/// the copy and request the mapping, without waiting for it.
+fn start_readback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    staging_buffer: &mut GrowBuffer,
+    ranges: &[(&wgpu::Buffer, usize)],
+) -> Result<PendingReadback, RunError> {
     let mut offsets = Vec::with_capacity(ranges.len());
     let mut total = 0usize;
     for &(_, bytes) in ranges {
@@ -2877,8 +3199,14 @@ fn read_buffers_with<R>(
             .checked_add(aligned)
             .ok_or(RunError::Capacity { what: "readback" })?;
     }
+    let (sender, receiver) = std::sync::mpsc::channel();
     if total == 0 {
-        return Ok(decode(&[], &offsets));
+        return Ok(PendingReadback {
+            staging: None,
+            total: 0,
+            offsets,
+            receiver,
+        });
     }
     let staging = staging_buffer.ensure_readback(device, "omvg-sift-staging", total);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2891,39 +3219,60 @@ fn read_buffers_with<R>(
         }
     }
     queue.submit(Some(encoder.finish()));
-    let slice = staging.slice(..total as u64);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    let deadline = std::time::Instant::now() + SiftGpuExtractor::TIMEOUT;
-    let map_result = loop {
-        device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|error| RunError::Readback(error.to_string()))?;
-        match receiver.try_recv() {
-            Ok(result) => break result,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(RunError::Readback(
-                    "mapping callback disconnected".to_string(),
-                ));
+    staging
+        .slice(..total as u64)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+    Ok(PendingReadback {
+        staging: Some(staging),
+        total: total as u64,
+        offsets,
+        receiver,
+    })
+}
+
+impl PendingReadback {
+    /// Wait for the mapping, then run `decode` on the mapped bytes and each
+    /// range's offset in them, without copying the mapping first.
+    fn finish<R>(
+        self,
+        device: &wgpu::Device,
+        decode: impl FnOnce(&[u8], &[usize]) -> R,
+    ) -> Result<R, RunError> {
+        let Some(staging) = self.staging else {
+            return Ok(decode(&[], &self.offsets));
+        };
+        let deadline = std::time::Instant::now() + SiftGpuExtractor::TIMEOUT;
+        let map_result = loop {
+            device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|error| RunError::Readback(error.to_string()))?;
+            match self.receiver.try_recv() {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(RunError::Readback(
+                        "mapping callback disconnected".to_string(),
+                    ));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(RunError::Fault(Fault::Timeout));
-        }
-        std::thread::yield_now();
-    };
-    map_result.map_err(|error| RunError::Readback(format!("{error:?}")))?;
-    let result = {
-        let data = slice
-            .get_mapped_range()
-            .map_err(|error| RunError::Readback(error.to_string()))?;
-        decode(&data, &offsets)
-    };
-    staging.unmap();
-    Ok(result)
+            if std::time::Instant::now() >= deadline {
+                return Err(RunError::Fault(Fault::Timeout));
+            }
+            std::thread::yield_now();
+        };
+        map_result.map_err(|error| RunError::Readback(format!("{error:?}")))?;
+        let slice = staging.slice(..self.total);
+        let result = {
+            let data = slice
+                .get_mapped_range()
+                .map_err(|error| RunError::Readback(error.to_string()))?;
+            decode(&data, &self.offsets)
+        };
+        staging.unmap();
+        Ok(result)
+    }
 }
 
 /// Pair each described feature with its descriptor, in detector order.
@@ -3648,6 +3997,68 @@ mod tests {
         assert!(!gpu.engine.scratch.is_poisoned());
         assert_eq!(features.keypoints(), expected.keypoints());
         assert_eq!(features.descriptors(), expected.descriptors());
+    }
+
+    fn assert_batch_matches_single(config: SiftExtractor, images: &[GrayImage]) {
+        let Ok(gpu) = SiftGpuExtractor::new(config.clone()) else {
+            return;
+        };
+        // A fresh extractor for the batch starts from untrained bounds, so the
+        // pipeline also reruns images that outgrow them.
+        let Ok(batched) = SiftGpuExtractor::new(config) else {
+            return;
+        };
+        let single: Vec<_> = images
+            .iter()
+            .map(|image| match gpu.extract_u8(image) {
+                Ok(features) => features,
+                Err(error) => panic!("GPU extraction failed: {error}"),
+            })
+            .collect();
+        // Owned images from a lazy iterator, as a folder decoder yields them.
+        let batch = batched.extract_u8_batch(images.iter().cloned());
+        assert_eq!(batch.len(), images.len());
+        for (index, (single, batch)) in single.iter().zip(batch).enumerate() {
+            let batch = match batch {
+                Ok(features) => features,
+                Err(error) => panic!("batch extraction of image {index} failed: {error}"),
+            };
+            assert_eq!(batch.keypoints(), single.keypoints(), "image {index}");
+            assert_eq!(batch.descriptors(), single.descriptors(), "image {index}");
+        }
+    }
+
+    #[test]
+    fn gpu_batch_matches_single_extractions() {
+        if gpu_or_skip(SiftPreset::Normal).is_none() {
+            return;
+        }
+        // Sizes change between images, one is too small for any feature and
+        // one has none, so both slots and the empty paths are exercised.
+        let images = [
+            integer_blob_grid(),
+            integer_blobs(128),
+            GrayImage::zeros(4, 4),
+            integer_blob_grid(),
+            GrayImage::zeros(96, 96),
+            integer_blobs(256),
+            integer_blobs(128),
+        ];
+        assert_batch_matches_single(SiftExtractor::with_preset(SiftPreset::Normal), &images);
+        assert_batch_matches_single(SiftExtractor::with_preset(SiftPreset::Ultra), &images);
+        // A budget selects on the host, so the batch extracts one at a time.
+        assert_batch_matches_single(
+            SiftExtractor::with_preset(SiftPreset::High)
+                .with_feature_budget(FeatureBudgetPolicy::strongest(5)),
+            &images,
+        );
+        let Some(gpu) = gpu_or_skip(SiftPreset::Normal) else {
+            return;
+        };
+        assert!(
+            gpu.extract_u8_batch(std::iter::empty::<GrayImage>())
+                .is_empty()
+        );
     }
 
     #[test]

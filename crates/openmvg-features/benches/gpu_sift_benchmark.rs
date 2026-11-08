@@ -26,7 +26,9 @@
 //!
 //! The report has three parts: per-image latency of the CPU extractor (which
 //! already parallelizes inside one image), CPU throughput with one image per
-//! Rayon worker, and GPU latency with one reused extractor. The parity section
+//! Rayon worker, and GPU latency with one reused extractor, one image at a
+//! time and pipelined with `extract_u8_batch`, over the images in memory and
+//! over the folder decoding each file on the way. The parity section
 //! matches each GPU keypoint to the nearest CPU keypoint.
 
 use std::path::{Path, PathBuf};
@@ -488,6 +490,73 @@ fn main() {
         if identical != gpu_features.len() {
             diff.report();
         }
+    }
+    // Pipelined over the same images, checked against the single extractions.
+    let mut batch_times = Vec::new();
+    let mut batch_identical = 0usize;
+    for round in 0..rounds {
+        let start = Instant::now();
+        let batch = gpu.extract_u8_batch(images.iter());
+        batch_times.push(ms(start) / images.len().max(1) as f64);
+        if round == 0 {
+            for (single, batch) in gpu_features.iter().zip(batch) {
+                let batch = batch.expect("GPU batch extraction");
+                if batch.keypoints() == single.keypoints()
+                    && batch.descriptors() == single.descriptors()
+                {
+                    batch_identical += 1;
+                }
+            }
+        }
+    }
+    let batch_mean = mean(&batch_times);
+    println!(
+        "GPU extract_u8_batch: median {:8.2} ms  mean {batch_mean:8.2} ms per image ({:.1} img/s), \
+         identical to extract_u8 on {batch_identical}/{} images",
+        median(&mut batch_times.clone()),
+        1e3 / batch_mean,
+        images.len()
+    );
+    // End to end over the folder: decode every file, one by one or pulled by
+    // the batch while the device works on the previous image.
+    if !profiling {
+        let start = Instant::now();
+        for path in &paths {
+            gpu.extract_u8(&read_image(path)).expect("GPU extraction");
+        }
+        let one_by_one = ms(start) / paths.len().max(1) as f64;
+        let start = Instant::now();
+        for result in gpu.extract_u8_batch(paths.iter().map(|path| read_image(path))) {
+            result.expect("GPU batch extraction");
+        }
+        let batched = ms(start) / paths.len().max(1) as f64;
+        // Decoding is the caller's side of the iterator: here a thread decodes
+        // a few files at a time in parallel and hands them over in order
+        // through a bounded channel, so at most a few images wait in memory.
+        let start = Instant::now();
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<GrayImage>(4);
+        let folder = &paths;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for chunk in folder.chunks(rayon::current_num_threads()) {
+                    let decoded: Vec<GrayImage> =
+                        chunk.par_iter().map(|path| read_image(path)).collect();
+                    for image in decoded {
+                        if sender.send(image).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            for result in gpu.extract_u8_batch(receiver.iter()) {
+                result.expect("GPU batch extraction");
+            }
+        });
+        let parallel = ms(start) / paths.len().max(1) as f64;
+        println!(
+            "Folder with decoding: one by one {one_by_one:8.2}, batched {batched:8.2}, \
+             batched with parallel decoding {parallel:8.2} ms per image"
+        );
     }
     if skip_cpu {
         return;
