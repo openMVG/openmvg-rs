@@ -41,7 +41,8 @@
 //! 8-bit values is uploaded as bytes, a quarter of its f32 size, and the u8
 //! path quantizes on the device and reads back packed bytes, so it transfers
 //! four times fewer descriptor bytes than the f32 path. Parameters are written
-//! with one queue write per submit, and the per-octave stages after refinement are recorded stage by stage, one
+//! with one queue write per submit, bind groups are reused across images, and
+//! the per-octave stages after refinement are recorded stage by stage, one
 //! command buffer each, so the octaves of a stage run concurrently.
 //!
 //! [`GrayImage`]: crate::extraction::GrayImage
@@ -2198,6 +2199,17 @@ impl Engine {
         buffers: &[&wgpu::Buffer],
     ) -> wgpu::BindGroup {
         let (buffer, offset) = params.push(&self.device, value);
+        let key = BindKey {
+            layout: layout.clone(),
+            page: buffer.clone(),
+            offset,
+            buffers: buffers.iter().map(|&storage| storage.clone()).collect(),
+        };
+        let epoch = params.epoch;
+        if let Some((bind_group, used)) = params.bind_groups.get_mut(&key) {
+            *used = epoch;
+            return bind_group.clone();
+        }
         let mut entries = Vec::with_capacity(buffers.len() + 1);
         entries.push(wgpu::BindGroupEntry {
             binding: 0,
@@ -2213,11 +2225,13 @@ impl Engine {
                 resource: storage.as_entire_binding(),
             });
         }
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout,
             entries: &entries,
-        })
+        });
+        params.bind_groups.insert(key, (bind_group.clone(), epoch));
+        bind_group
     }
 
     /// Record one dispatch. Consecutive dispatches share one compute pass,
@@ -2444,12 +2458,33 @@ struct ParamArena {
     pages: Vec<wgpu::Buffer>,
     data: Vec<u8>,
     flushed: usize,
+    /// Bind groups by layout, parameter slot and bound buffers. Scratch
+    /// buffers persist and the slots repeat for the same image geometry, so
+    /// later images reuse every bind group instead of creating ~120 per image.
+    bind_groups: std::collections::HashMap<BindKey, (wgpu::BindGroup, u64)>,
+    /// Incremented by every pass; entries unused for `BIND_GROUP_EPOCHS`
+    /// passes are dropped, so a buffer replaced by a larger one is freed.
+    epoch: u64,
 }
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BindKey {
+    layout: wgpu::BindGroupLayout,
+    page: wgpu::Buffer,
+    offset: u64,
+    buffers: Vec<wgpu::Buffer>,
+}
+
+const BIND_GROUP_EPOCHS: u64 = 3;
 
 impl ParamArena {
     fn reset(&mut self) {
         self.data.clear();
         self.flushed = 0;
+        self.epoch += 1;
+        let epoch = self.epoch;
+        self.bind_groups
+            .retain(|_, (_, used)| epoch - *used < BIND_GROUP_EPOCHS);
     }
 
     fn push<T: bytemuck::Pod>(&mut self, device: &wgpu::Device, value: &T) -> (wgpu::Buffer, u64) {
