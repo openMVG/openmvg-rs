@@ -238,9 +238,9 @@ pub use problem::{
     ProblemError, ResidualScale, ResidualSpace, RobustLoss,
 };
 pub use solver::{
-    AuditError, BundleAdjuster, ConvergenceReason, LinearSolver, Observability,
-    ObservabilityDiagnostics, Solution, SolutionError, SolveConfig, SolveDiagnostics, SolveError,
-    SolveReport, SolveStatus, StationarityAudit,
+    AuditError, BundleAdjuster, ConvergenceReason, IntrinsicStandardDeviations, LinearSolver,
+    Observability, ObservabilityDiagnostics, Solution, SolutionError, SolveConfig,
+    SolveDiagnostics, SolveError, SolveReport, SolveStatus, StationarityAudit,
 };
 
 // Compile the README example.

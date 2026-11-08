@@ -454,6 +454,50 @@ impl SolveDiagnostics {
     }
 }
 
+/// Marginal standard deviations of the parameters a self-calibrating solve refined for one
+/// intrinsic group, for one pixel of independent per-axis observation noise.
+///
+/// They are the square roots of the diagonal of the inverse undamped information at the
+/// returned state: the Gauss-Newton normal matrix with the final robust weights, normalized to
+/// one at zero residual, with poses and points marginalized out. They grow linearly with the
+/// noise, so multiply them by the per-axis noise of the observations, for example
+/// [`SolveReport::final_inlier_rmse`] divided by √2.
+///
+/// They describe precision under the declared camera model and independent observation noise.
+/// A camera model that cannot represent the lens, or detection errors shared between
+/// observations, bias the result without appearing here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct IntrinsicStandardDeviations {
+    /// Intrinsic group index in the problem.
+    pub intrinsic: usize,
+    /// Standard deviation of `ln f`: the focal length's, relative to its value.
+    pub relative_focal: f64,
+    /// Standard deviation of `k1`; `None` when the group does not refine it.
+    pub k1: Option<f64>,
+    /// Standard deviation of `k2`; `None` when the group does not refine it.
+    pub k2: Option<f64>,
+}
+
+impl IntrinsicStandardDeviations {
+    /// For adjuster implementers: the deviations of one refined group, each field as documented
+    /// on the type.
+    #[must_use]
+    pub const fn new(
+        intrinsic: usize,
+        relative_focal: f64,
+        k1: Option<f64>,
+        k2: Option<f64>,
+    ) -> Self {
+        Self {
+            intrinsic,
+            relative_focal,
+            k1,
+            k2,
+        }
+    }
+}
+
 /// What one solve did: its status, its objectives and errors before and after, and the
 /// diagnostics of the returned state. [Accepting a result](crate#accepting-a-result) lists what
 /// to check before using the solution.
@@ -467,6 +511,7 @@ pub struct SolveReport {
     final_rmse: f64,
     diagnostics: SolveDiagnostics,
     unconstrained_intrinsics: Vec<usize>,
+    intrinsic_standard_deviations: Vec<IntrinsicStandardDeviations>,
     observation_count: Option<usize>,
     inlier_count: Option<usize>,
     final_inlier_rmse: Option<f64>,
@@ -506,6 +551,7 @@ impl SolveReport {
             final_rmse,
             diagnostics,
             unconstrained_intrinsics: Vec::new(),
+            intrinsic_standard_deviations: Vec::new(),
             observation_count: None,
             inlier_count: None,
             final_inlier_rmse: None,
@@ -518,6 +564,17 @@ impl SolveReport {
     #[must_use]
     pub fn with_unconstrained_intrinsics(mut self, intrinsics: Vec<usize>) -> Self {
         self.unconstrained_intrinsics = intrinsics;
+        self
+    }
+
+    /// Record the standard deviations of the intrinsic groups the solve refined, one entry per
+    /// refined group in ascending group order.
+    #[must_use]
+    pub fn with_intrinsic_standard_deviations(
+        mut self,
+        deviations: Vec<IntrinsicStandardDeviations>,
+    ) -> Self {
+        self.intrinsic_standard_deviations = deviations;
         self
     }
 
@@ -620,6 +677,14 @@ impl SolveReport {
     #[must_use]
     pub fn unconstrained_intrinsics(&self) -> &[usize] {
         &self.unconstrained_intrinsics
+    }
+
+    /// Standard deviations of the intrinsic groups the solve refined, in ascending group order;
+    /// empty when it refined none, or when the adjuster returned the input state instead of its
+    /// result. Groups listed in [`Self::unconstrained_intrinsics`] are not refined.
+    #[must_use]
+    pub fn intrinsic_standard_deviations(&self) -> &[IntrinsicStandardDeviations] {
+        &self.intrinsic_standard_deviations
     }
 }
 
@@ -1088,6 +1153,7 @@ impl Solution {
             // The input's rank and gradient need not match the accepted proposal.
             // Quarantine scope and held-intrinsic attempt decisions remain unchanged.
             self.report.diagnostics.invalidate_returned_state();
+            self.report.intrinsic_standard_deviations.clear();
         }
         // Exact same-geometry proposals keep their fresh certificates. Both paths
         // report the returned input metrics while retaining actual attempted work.

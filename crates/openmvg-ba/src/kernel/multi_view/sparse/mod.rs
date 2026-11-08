@@ -39,6 +39,7 @@ pub use api::{
 #[cfg(any(test, feature = "unstable-internals"))]
 pub use calibrated::refine_ba_multi_view_sparse;
 pub use calibrated::refine_ba_multi_view_sparse_with_factors;
+pub(crate) use covariance::SparseIntrinsicMarginalCovariance;
 #[cfg(any(test, feature = "unstable-internals"))]
 pub use covariance::{
     SparseBundleAdjustmentCovarianceError, selected_marginal_covariances_ba_multi_view_sparse,

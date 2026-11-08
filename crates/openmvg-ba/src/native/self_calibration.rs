@@ -13,7 +13,7 @@ use crate::kernel::RelativePose;
 use crate::kernel::multi_view::sparse::SparseSelfCalibrationWorkspace;
 use crate::kernel::multi_view::sparse::refine_ba_multi_view_self_calibrating_grouped_sparse_with_factors;
 use crate::kernel::multi_view::sparse::{
-    DirectSchurAssembly, SparseBundleAdjustmentReport,
+    DirectSchurAssembly, SparseBundleAdjustmentReport, SparseIntrinsicMarginalCovariance,
     intrinsic_marginal_covariances_self_calibrating_grouped_sparse,
 };
 use crate::kernel::multi_view::{
@@ -21,7 +21,10 @@ use crate::kernel::multi_view::{
     self_calibration::RadialCamera, self_calibration::SelfCalibratingMeasurements,
 };
 use crate::numerics::refine::Options;
-use crate::{BundleProblem, LinearSolver, ResidualSpace, Solution, SolveConfig, SolveError};
+use crate::{
+    BundleProblem, IntrinsicStandardDeviations, LinearSolver, ResidualSpace, Solution, SolveConfig,
+    SolveError,
+};
 use openmvg_core::{
     camera::{BrownConradyCamera, Camera, CameraModel, RadialDistortion},
     model::CameraIntrinsics,
@@ -232,9 +235,12 @@ pub(super) fn solve_self_calibrating(
     );
     let options = solver_options(problem, config)?;
     let (report, mut workspace) = refine_self_calibrating(&mut prepared, config, options)?;
-    let unconstrained = unconstrained_intrinsics(problem, &prepared, &mut workspace, options);
+    let marginals = intrinsic_marginals(&prepared, &mut workspace, options);
+    let unconstrained = unconstrained_intrinsics(problem, &prepared, marginals.as_deref());
     if unconstrained.is_empty() {
-        return raise_self_calibrating_solution(problem, prepared, &report, Vec::new());
+        // The marginals were evaluated at this solve's result, the state returned.
+        let deviations = standard_deviations(marginals.as_deref().unwrap_or_default());
+        return raise_self_calibrating_solution(problem, prepared, &report, Vec::new(), deviations);
     }
     // Re-solve from the input state so the held groups' poses and points do not keep what the
     // first solve's drift along the weak direction absorbed. Fixing parameters only shrinks the
@@ -244,21 +250,22 @@ pub(super) fn solve_self_calibrating(
     for &group in &unconstrained {
         prepared.fixed_intrinsics[group] = true;
     }
-    let (report, _) = refine_self_calibrating(&mut prepared, config, options)?;
-    raise_self_calibrating_solution(problem, prepared, &report, unconstrained)
+    let (report, mut workspace) = refine_self_calibrating(&mut prepared, config, options)?;
+    // The held groups are fixed now, so only the remaining free groups have marginals.
+    let deviations = intrinsic_marginals(&prepared, &mut workspace, options)
+        .map_or_else(Vec::new, |marginals| standard_deviations(&marginals));
+    raise_self_calibrating_solution(problem, prepared, &report, unconstrained, deviations)
 }
 
-/// Free intrinsic groups whose marginal uncertainty exceeds
-/// [`MAX_INTRINSIC_CORNER_DISPLACEMENT_STD`]; every free group when the final information cannot
-/// be factored, or its direct storage does not fit the workspace budget, because nothing then
-/// certifies the intrinsics.
-fn unconstrained_intrinsics(
-    problem: &BundleProblem,
+/// Marginal covariance, under unit pixel noise, of every free intrinsic group at the prepared
+/// state; `None` when the final information cannot be factored, or its direct storage does not
+/// fit the workspace budget.
+fn intrinsic_marginals(
     prepared: &PreparedSelfCalibratingProblem,
     workspace: &mut SparseSelfCalibrationWorkspace,
     options: Options,
-) -> Vec<usize> {
-    let marginals = intrinsic_marginal_covariances_self_calibrating_grouped_sparse(
+) -> Option<Vec<SparseIntrinsicMarginalCovariance>> {
+    intrinsic_marginal_covariances_self_calibrating_grouped_sparse(
         &prepared.poses,
         &prepared.points,
         &prepared.intrinsics,
@@ -269,8 +276,42 @@ fn unconstrained_intrinsics(
         workspace,
         options.loss,
         crate::numerics::refine::NoiseModel::Unit,
-    );
-    let Ok(marginals) = marginals else {
+    )
+    .ok()
+}
+
+/// The diagonal deviations of each marginal, in `(ln f, k1, k2)` order. A group with a
+/// non-finite deviation is left out: nothing certifies it.
+fn standard_deviations(
+    marginals: &[SparseIntrinsicMarginalCovariance],
+) -> Vec<IntrinsicStandardDeviations> {
+    marginals
+        .iter()
+        .filter_map(|marginal| {
+            let deviation = |parameter: usize| {
+                (parameter < marginal.dimension)
+                    .then(|| marginal.matrix[parameter][parameter].sqrt())
+            };
+            let focal = deviation(0)?;
+            let (k1, k2) = (deviation(1), deviation(2));
+            [Some(focal), k1, k2]
+                .into_iter()
+                .flatten()
+                .all(f64::is_finite)
+                .then(|| IntrinsicStandardDeviations::new(marginal.group, focal, k1, k2))
+        })
+        .collect()
+}
+
+/// Free intrinsic groups whose marginal uncertainty exceeds
+/// [`MAX_INTRINSIC_CORNER_DISPLACEMENT_STD`]; every free group without marginals, because
+/// nothing then certifies the intrinsics.
+fn unconstrained_intrinsics(
+    problem: &BundleProblem,
+    prepared: &PreparedSelfCalibratingProblem,
+    marginals: Option<&[SparseIntrinsicMarginalCovariance]>,
+) -> Vec<usize> {
+    let Some(marginals) = marginals else {
         return (0..prepared.intrinsics.len())
             .filter(|&group| !prepared.fixed_intrinsics[group])
             .collect();
@@ -377,6 +418,7 @@ fn raise_self_calibrating_solution(
     prepared: PreparedSelfCalibratingProblem,
     report: &SparseBundleAdjustmentReport,
     unconstrained_intrinsics: Vec<usize>,
+    intrinsic_standard_deviations: Vec<IntrinsicStandardDeviations>,
 ) -> Result<Solution, SolveError> {
     let mut poses = problem
         .poses()
@@ -430,7 +472,8 @@ fn raise_self_calibrating_solution(
         intrinsics,
         points,
         solve_report(report, None, problem.gauge())?
-            .with_unconstrained_intrinsics(unconstrained_intrinsics),
+            .with_unconstrained_intrinsics(unconstrained_intrinsics)
+            .with_intrinsic_standard_deviations(intrinsic_standard_deviations),
     )
     .map_err(super::reporting::map_solution_error)
 }

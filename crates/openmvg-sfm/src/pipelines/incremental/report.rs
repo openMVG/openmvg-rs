@@ -307,6 +307,18 @@ impl IncrementalSfmReport {
             initialization,
         }
     }
+
+    /// The self-calibrating bundle adjustment of an applied final refinement; `None` when
+    /// self-calibration was disabled or the refinement was rolled back.
+    pub(crate) fn committed_self_calibration(
+        &self,
+    ) -> Option<&crate::ops::reconstruction::BundleReport> {
+        self.final_refinement
+            .as_deref()
+            .filter(|refinement| refinement.outcome == IncrementalFinalRefinementStatus::Applied)?
+            .self_calibration
+            .as_ref()
+    }
 }
 
 fn collect_unregistered_image_diagnostics(

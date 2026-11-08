@@ -398,9 +398,9 @@ pub mod unstable {
     pub mod backends {
         pub use crate::ba::backend::{
             BaBackendFailure, BaCommitRejection, BaConvergenceReason, BaDiagnostics, BaFailureKind,
-            BaNotApplicable, BaObservabilityDiagnostics, BaPreflightDecision,
-            BaPreflightDeferralReason, BaPreflightReport, BaRankAssessment, BaSolveStatus,
-            BaUnsupportedCapability, BundleAdjustmentReport,
+            BaIntrinsicUncertainty, BaNotApplicable, BaObservabilityDiagnostics,
+            BaPreflightDecision, BaPreflightDeferralReason, BaPreflightReport, BaRankAssessment,
+            BaSolveStatus, BaUnsupportedCapability, BundleAdjustmentReport,
         };
         pub use crate::backends::{
             CameraCenters, FeatureContext, FeatureExtractor, GeometricVerifier, PairContext,

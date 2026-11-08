@@ -442,6 +442,17 @@ impl GlobalSfmReport {
             .accepted_global_attempt_index()
             .and_then(|index| self.attempts.get(index))
     }
+
+    /// The last self-calibrating bundle adjustment of the committed attempt; `None` when no
+    /// attempt was committed or its self-calibration did not run or was rolled back.
+    pub(crate) fn committed_self_calibration(
+        &self,
+    ) -> Option<&crate::ops::reconstruction::BundleReport> {
+        match &self.accepted_global_attempt()?.outcome {
+            GlobalCandidateStatus::Accepted { finish, .. } => finish.committed_self_calibration(),
+            _ => None,
+        }
+    }
 }
 
 /// Typed graph preparation for global execution.

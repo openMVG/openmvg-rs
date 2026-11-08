@@ -10,12 +10,29 @@ break the API. [MIGRATION.md](MIGRATION.md) states the compatibility rules.
 
 ### Added
 
+#### `openmvg-ba`
+
+- `SolveReport::intrinsic_standard_deviations`: the marginal standard deviations of the focal
+  length and radial coefficients a self-calibrating solve refined, for one pixel of observation
+  noise. The native adjuster already computed these marginals to decide which groups to hold;
+  it now returns them.
+
 #### `openmvg-sfm`
 
+- `BaDiagnostics::intrinsic_uncertainties` and `RunReport::intrinsic_uncertainties`: the
+  standard deviations of the refined intrinsics, scaled to the fitted noise (inlier RMSE over
+  √2), with the focal length's in pixels. They are formal: they assume independent noise and a
+  camera model that fits the lens, so runs of two engines on the same images can differ by
+  more.
 - `DatasetConfig::with_camera_model` and `DatasetConfig::with_share_unknown_cameras`, so
   `Dataset::from_dir_with` can declare the camera model of EXIF groups and give images without
   EXIF camera make and model one shared camera, as `openmvg-sfm --camera-model` and
   `--share-intrinsics` do.
+
+#### `openmvg-cli`
+
+- `openmvg-sfm` prints the standard deviations of each refined camera group next to its
+  intrinsics, for example `(refined; std f=0.28 k1=3.3e-4 k2=5.7e-4)`.
 
 #### Python bindings
 
