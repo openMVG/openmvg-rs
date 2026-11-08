@@ -321,6 +321,21 @@ impl Default for GlobalPoseTrustReport {
     }
 }
 
+impl GlobalFinishReport {
+    /// The second self-calibrating bundle adjustment of a committed self-calibration, the one
+    /// whose intrinsics the reconstruction keeps; `None` when it did not run or was rolled back.
+    pub(crate) fn committed_self_calibration(
+        &self,
+    ) -> Option<&crate::ops::reconstruction::BundleReport> {
+        match self.self_calibration.as_ref()? {
+            GlobalSelfCalibrationStatus::Committed(calibration) => {
+                Some(&calibration.retriangulation.bundle_adjustment)
+            }
+            GlobalSelfCalibrationStatus::RolledBack(_) => None,
+        }
+    }
+}
+
 /// Diagnostics for the staged global-SfM refinement.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GlobalFinishReport {

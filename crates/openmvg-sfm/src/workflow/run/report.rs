@@ -4,6 +4,7 @@
 //! The versioned run report and its per-view verdicts.
 
 use super::config::{SfmConfig, SfmEngine};
+use crate::ba::backend::BaIntrinsicUncertainty;
 use crate::pipelines::global::report::GlobalNoReconstructionReason;
 use crate::pipelines::global::{GlobalCompletionReport, GlobalPreparationReport, GlobalSfmReport};
 use crate::pipelines::incremental::{IncrementalSfmReport, UnregisteredViewDiagnostic};
@@ -337,6 +338,23 @@ impl RunReport {
                 GlobalOutcome::NoReconstruction { .. } => FinalRoute::GlobalEmpty,
             },
         }
+    }
+
+    /// Standard deviations of the intrinsics in the returned reconstruction, from the last
+    /// self-calibrating bundle adjustment the run committed: the final refinement's for
+    /// Incremental, the second self-calibrating solve's for Global. Empty when self-calibration
+    /// did not run or was rolled back; groups it held or that stayed fixed have no entry.
+    #[must_use]
+    pub fn intrinsic_uncertainties(&self) -> &[BaIntrinsicUncertainty] {
+        let bundle = match &self.outcome {
+            SfmOutcome::Incremental { report } => report.committed_self_calibration(),
+            SfmOutcome::Global {
+                result: GlobalOutcome::Reconstructed { report },
+                ..
+            } => report.committed_self_calibration(),
+            SfmOutcome::Global { .. } => None,
+        };
+        bundle.map_or(&[], |bundle| &bundle.ba.diagnostics.intrinsic_uncertainties)
     }
 
     /// Why a Global run returned no reconstruction; `None` when the run has one.

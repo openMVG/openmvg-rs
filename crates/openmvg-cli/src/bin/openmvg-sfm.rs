@@ -27,6 +27,7 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use openmvg_core::camera::CameraModelType;
 use openmvg_io::WriteOptions;
+use openmvg_sfm::ba::BaIntrinsicUncertainty;
 use openmvg_sfm::config::{GlobalSfmConfig, IncrementalSfmConfig};
 use openmvg_sfm::image::{
     ImageDatasetConfig, ImageIntrinsicPolicy, ImageProject, discover_dataset_images,
@@ -530,7 +531,12 @@ fn run(cli: Cli) -> DynResult<()> {
         frontend_seconds,
         reconstruction_seconds,
     );
-    print_intrinsics(&reconstruction, &input_cameras, self_calibrate);
+    print_intrinsics(
+        &reconstruction,
+        &input_cameras,
+        self_calibrate,
+        run_report.intrinsic_uncertainties(),
+    );
     println!("PLY: {}", output_dir.join("reconstruction.ply").display());
     println!(
         "OMVG (0.1-draft format, may change before 1.0): {}",
@@ -562,11 +568,13 @@ fn reconstruct(
     }
 }
 
-/// Log every camera group with a registered view: its camera before and after reconstruction.
+/// Log every camera group with a registered view: its camera before and after reconstruction,
+/// and the standard deviations of what self-calibration refined.
 fn print_intrinsics(
     reconstruction: &Reconstruction,
     input_cameras: &[Camera],
     self_calibrate: bool,
+    uncertainties: &[BaIntrinsicUncertainty],
 ) {
     let mut registered_per_group = vec![0usize; input_cameras.len()];
     for (view, _) in reconstruction.registered_views() {
@@ -592,13 +600,27 @@ fn print_intrinsics(
         } else {
             "refined"
         };
+        let deviations = uncertainties
+            .iter()
+            .find(|uncertainty| uncertainty.intrinsic.index() == group)
+            .map_or_else(String::new, describe_uncertainty);
         println!(
-            "intrinsic {group} ({} views): {} -> {} ({state})",
+            "intrinsic {group} ({} views): {} -> {} ({state}{deviations})",
             registered_per_group[group],
             describe_camera(input),
             describe_camera(refined),
         );
     }
+}
+
+/// Standard deviations of a refined camera group, for the per-group log.
+fn describe_uncertainty(uncertainty: &BaIntrinsicUncertainty) -> String {
+    let coefficients = [("k1", uncertainty.k1), ("k2", uncertainty.k2)]
+        .into_iter()
+        .filter_map(|(name, deviation)| {
+            deviation.map(|deviation| format!(" {name}={deviation:.1e}"))
+        });
+    format!("; std f={:.2}", uncertainty.focal_px) + &coefficients.collect::<String>()
 }
 
 #[cfg(test)]

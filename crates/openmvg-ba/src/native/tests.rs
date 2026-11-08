@@ -981,6 +981,117 @@ fn thin_group_keeps_its_input_intrinsics_while_others_self_calibrate() {
 }
 
 #[test]
+fn self_calibration_reports_the_deviations_of_each_refined_parameter() {
+    let truth = [
+        Camera::try_pinhole(600.0, 600.0, 320.0, 240.0).unwrap(),
+        brown_conrady(720.0, RadialDistortion::K1(-0.12)),
+        brown_conrady(650.0, RadialDistortion::K1K2(0.08, -0.03)),
+    ];
+    let initial = [
+        Camera::try_pinhole(624.0, 624.0, 320.0, 240.0).unwrap(),
+        brown_conrady(749.0, RadialDistortion::K1(0.0)),
+        truth[2].clone(),
+    ];
+    let refined = |problem: &BundleProblem| {
+        solve_stress_fixture(problem)
+            .report()
+            .intrinsic_standard_deviations()
+            .iter()
+            .map(|deviations| {
+                (
+                    deviations.intrinsic,
+                    deviations.k1.is_some(),
+                    deviations.k2.is_some(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let free = mixed_model_fixture(&truth, &initial, [SELF_CALIBRATE; 3]);
+    assert_eq!(
+        refined(&free),
+        [(0, false, false), (1, true, false), (2, true, true)]
+    );
+    // A held group is not refined, so it has no deviations.
+    let thin =
+        mixed_model_fixture_observing(&truth, &initial, [SELF_CALIBRATE; 3], |camera, pixel| {
+            camera < 6 || (pixel - Point2::new(320.0, 240.0)).norm() < 100.0
+        });
+    assert_eq!(refined(&thin), [(0, false, false), (1, true, false)]);
+}
+
+#[test]
+fn focal_deviation_matches_the_spread_of_noisy_solves() {
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, Normal};
+
+    const NOISE_PX: f64 = 0.5;
+    const SOLVES: usize = 40;
+    let truth = [
+        Camera::try_pinhole(600.0, 600.0, 320.0, 240.0).unwrap(),
+        brown_conrady(720.0, RadialDistortion::K1(-0.12)),
+        brown_conrady(650.0, RadialDistortion::K1K2(0.08, -0.03)),
+    ];
+    let clean = mixed_model_fixture(&truth, &truth, [SELF_CALIBRATE; 3]);
+    let noise = Normal::new(0.0, NOISE_PX).unwrap();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let mut log_focals = Vec::with_capacity(SOLVES);
+    let mut predicted = Vec::with_capacity(SOLVES);
+    for _ in 0..SOLVES {
+        let observations = clean
+            .observations()
+            .iter()
+            .map(|observation| {
+                let offset = Vector2::new(noise.sample(&mut rng), noise.sample(&mut rng));
+                BundleObservation::try_new(
+                    observation.pose(),
+                    observation.intrinsic(),
+                    observation.point(),
+                    observation.pixel() + offset,
+                )
+                .unwrap()
+            })
+            .collect();
+        let problem = BundleProblem::builder(
+            clean.poses().to_vec(),
+            clean.intrinsics().to_vec(),
+            clean.points().to_vec(),
+            observations,
+        )
+        .with_robust_loss(clean.robust_loss())
+        .with_gauge(clean.gauge())
+        .build()
+        .unwrap();
+        let solution = solve_stress_fixture(&problem);
+        let deviations = solution.report().intrinsic_standard_deviations()[1];
+        assert_eq!(deviations.intrinsic, 1);
+        predicted.push(deviations.relative_focal * NOISE_PX);
+        log_focals.push(
+            solution.intrinsics()[1]
+                .camera()
+                .focal_lengths()
+                .unwrap()
+                .0
+                .ln(),
+        );
+    }
+    let mean = log_focals.iter().sum::<f64>() / SOLVES as f64;
+    let spread = (log_focals
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (SOLVES - 1) as f64)
+        .sqrt();
+    let predicted = predicted.iter().sum::<f64>() / SOLVES as f64;
+    // Forty solves estimate a deviation to about 11% (one sigma); allow three sigma.
+    let ratio = spread / predicted;
+    assert!(
+        (0.67..=1.33).contains(&ratio),
+        "spread {spread:e}, predicted {predicted:e}"
+    );
+}
+
+#[test]
 fn fixed_distorted_group_is_honored_while_others_self_calibrate() {
     let truth = [
         Camera::try_pinhole(600.0, 600.0, 320.0, 240.0).unwrap(),

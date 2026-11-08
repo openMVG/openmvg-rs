@@ -111,6 +111,32 @@ pub struct BaDiagnostics {
     /// observations did not constrain the declared camera model's parameters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unconstrained_intrinsics: Vec<IntrinsicId>,
+    /// Standard deviations of the intrinsics a self-calibrating solve refined, one entry per
+    /// refined group; empty when the solve refined none or the backend did not report them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intrinsic_uncertainties: Vec<BaIntrinsicUncertainty>,
+}
+
+/// Marginal standard deviations of one refined intrinsic group, for the noise of the
+/// observations the solve fitted.
+///
+/// They measure how well the observations pin the parameters down under the declared camera
+/// model, assuming independent noise. They do not include a model error, or a detection error
+/// shared between images, so a run on other images of the same camera can differ by more.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BaIntrinsicUncertainty {
+    /// The refined group.
+    pub intrinsic: IntrinsicId,
+    /// Per-axis pixel noise the deviations assume: the solve's inlier RMSE divided by √2.
+    pub pixel_noise: f64,
+    /// Standard deviation of the focal length, in pixels.
+    pub focal_px: f64,
+    /// Standard deviation of `k1`; `None` when the group does not refine it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k1: Option<f64>,
+    /// Standard deviation of `k2`; `None` when the group does not refine it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k2: Option<f64>,
 }
 
 /// Evidence-based reason a numerically returned BA proposal cannot be committed.

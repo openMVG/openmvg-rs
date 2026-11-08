@@ -382,3 +382,88 @@ fn negligible_cleanup_scales_with_the_active_problem() {
     assert!(!cleanup_removal_is_negligible(129, 1_280_000, 1e-4));
     assert!(!cleanup_removal_is_negligible(1, 100, 1e-4));
 }
+
+#[test]
+fn intrinsic_uncertainties_are_scaled_to_the_fitted_noise() {
+    use openmvg_ba::{
+        BundleIntrinsic, BundleObservation, BundlePoint, BundlePose, BundleProblem,
+        IntrinsicStandardDeviations, IntrinsicVariables, Observability, PoseVariables, RobustLoss,
+        Solution, SolveDiagnostics, SolveReport, SolveStatus, StationarityAudit,
+    };
+    use openmvg_core::model::{CameraIntrinsics, WorldToCameraPose};
+
+    let camera = Camera::try_pinhole(800.0, 800.0, 320.0, 240.0).unwrap();
+    let intrinsics = CameraIntrinsics::try_new(camera.clone(), 640, 480).unwrap();
+    let poses: Vec<_> = [0.0, 1.0]
+        .into_iter()
+        .map(|x| {
+            WorldToCameraPose::from_rotation_center(Rotation3::identity(), Point3::new(x, 0.0, 0.0))
+                .unwrap()
+        })
+        .collect();
+    let points: Vec<_> = (0..9)
+        .map(|i| Point3::new(f64::from(i % 3) - 0.5, f64::from(i / 3) - 1.0, 5.0))
+        .collect();
+    // Every observation is one pixel off along x, so the inlier RMSE is one pixel.
+    let mut observations = Vec::new();
+    for (pose_index, pose) in poses.iter().enumerate() {
+        for (point_index, point) in points.iter().enumerate() {
+            let pixel = camera
+                .project(&pose.project_to_camera(point).coords)
+                .unwrap();
+            observations.push(
+                BundleObservation::try_new(
+                    pose_index,
+                    0,
+                    point_index,
+                    pixel + nalgebra::Vector2::x(),
+                )
+                .unwrap(),
+            );
+        }
+    }
+    let problem = BundleProblem::builder(
+        poses
+            .iter()
+            .map(|pose| BundlePose::new(pose.clone(), PoseVariables::FIXED))
+            .collect(),
+        vec![BundleIntrinsic::try_new(intrinsics.clone(), IntrinsicVariables::FIXED).unwrap()],
+        points
+            .iter()
+            .map(|point| BundlePoint::try_new(*point).unwrap())
+            .collect(),
+        observations,
+    )
+    .with_robust_loss(RobustLoss::Squared)
+    .build()
+    .unwrap();
+    let diagnostics = SolveDiagnostics::new(
+        0,
+        0,
+        StationarityAudit::try_from_fresh_zero_damping(0.0).unwrap(),
+        Observability::FullRank,
+        0,
+        0,
+    );
+    let report = SolveReport::try_new(SolveStatus::Skipped, 0, 9.0, 9.0, 1.0, 1.0, diagnostics)
+        .unwrap()
+        .with_intrinsic_standard_deviations(vec![IntrinsicStandardDeviations::new(
+            0,
+            1e-3,
+            Some(2e-3),
+            None,
+        )]);
+    let solution = Solution::try_new(&problem, poses, vec![intrinsics], points, report).unwrap();
+
+    let uncertainties =
+        super::super::bundle::intrinsic_uncertainties(&[IntrinsicId::new(4)], &solution);
+
+    let noise = std::f64::consts::FRAC_1_SQRT_2;
+    assert_eq!(uncertainties.len(), 1);
+    let uncertainty = &uncertainties[0];
+    assert_eq!(uncertainty.intrinsic, IntrinsicId::new(4));
+    assert!((uncertainty.pixel_noise - noise).abs() < 1e-12);
+    assert!((uncertainty.focal_px - 1e-3 * 800.0 * noise).abs() < 1e-12);
+    assert!((uncertainty.k1.unwrap() - 2e-3 * noise).abs() < 1e-15);
+    assert_eq!(uncertainty.k2, None);
+}

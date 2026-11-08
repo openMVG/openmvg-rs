@@ -6,8 +6,8 @@
 use super::residual::is_generalized_camera;
 use super::*;
 use crate::ba::backend::{
-    BaCommitRejection, BaConvergenceReason, BaDiagnostics, BaObservabilityDiagnostics,
-    BaRankAssessment, BaSolveStatus,
+    BaCommitRejection, BaConvergenceReason, BaDiagnostics, BaIntrinsicUncertainty,
+    BaObservabilityDiagnostics, BaRankAssessment, BaSolveStatus,
 };
 use crate::model::PoseRecord;
 use crate::two_view::ResidualUnit;
@@ -213,6 +213,8 @@ pub fn bundle_adjust(
         .iter()
         .filter_map(|&group| prepared.intrinsic_ids.get(group).copied())
         .collect();
+    report.diagnostics.intrinsic_uncertainties =
+        intrinsic_uncertainties(&prepared.intrinsic_ids, &solution);
 
     // Treat the backend as a numerical boundary: validate the complete proposal before
     // committing any part of it. A divergent BA used to write non-finite cameras first,
@@ -402,6 +404,39 @@ fn canonical_solve_status(status: openmvg_ba::SolveStatus) -> BaSolveStatus {
         openmvg_ba::SolveStatus::Skipped => BaSolveStatus::Skipped,
         _ => BaSolveStatus::Unknown,
     }
+}
+
+/// The solution's intrinsic standard deviations for the per-axis noise of its inlier
+/// observations, with the focal deviation in pixels. Empty without an inlier RMSE in pixels,
+/// since nothing then gives the noise.
+pub(super) fn intrinsic_uncertainties(
+    intrinsic_ids: &[IntrinsicId],
+    solution: &Solution,
+) -> Vec<BaIntrinsicUncertainty> {
+    let report = solution.report();
+    let pixel_noise = match (solution.residual_space(), report.final_inlier_rmse()) {
+        (ResidualSpace::Pixels, Some(rmse)) => rmse / std::f64::consts::SQRT_2,
+        _ => return Vec::new(),
+    };
+    report
+        .intrinsic_standard_deviations()
+        .iter()
+        .filter_map(|deviations| {
+            let intrinsic = *intrinsic_ids.get(deviations.intrinsic)?;
+            let (focal, _) = solution
+                .intrinsics()
+                .get(deviations.intrinsic)?
+                .camera()
+                .focal_lengths()?;
+            Some(BaIntrinsicUncertainty {
+                intrinsic,
+                pixel_noise,
+                focal_px: deviations.relative_focal * focal * pixel_noise,
+                k1: deviations.k1.map(|deviation| deviation * pixel_noise),
+                k2: deviations.k2.map(|deviation| deviation * pixel_noise),
+            })
+        })
+        .collect()
 }
 
 /// Convert the BA problem and solution into the serialized SfM run receipt.
