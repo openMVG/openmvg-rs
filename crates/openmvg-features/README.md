@@ -95,6 +95,16 @@ move a little. GPU memory is the extractor's resident buffers after the first im
 driver add about 250 MiB. The folder column decodes the files: PGM for castle-P30 and Sceaux
 Castle, JPEG for South Building, whose decoding bounds that column.
 
+Results on Apple M1
+
+| Data, preset | Features, CPU / GPU | CPU, one image | CPU, 8 images in parallel | GPU `extract_u8` | GPU `extract_u8_batch` | Folder, batch with parallel decoding | Batch against CPU in parallel | GPU keypoints matching a CPU keypoint | Identical descriptor bytes | Orientation error p99 / max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| South Building Normal | 24,388.6 / 24,388.5 | 380.04 ms | 285.79 ms | 144.95 ms | 137.77 ms | 141.89 ms | 2.0x | 99.993% | 97.67% | 1.50e-5 / 2.22e-2 rad |
+| South Building High | 31,620.5 / 31,618.0 | 560.09 ms | 338.83 ms | 177.11 ms | 169.66 ms | 174.71 ms | 1.9x | 99.991% | 96.92% | 2.05e-5 / 2.55e-2 rad |
+| South Building Ultra* |  — / 21,683.5 | — | — | 1,058.39 ms | 1,055.41 ms | 1,039.54 ms | — | — | — | — |
+
+* Ultra: the GPU measurements completed, but the remaining CPU/parity measurements ran out of memory (OOM).
+
 ### GPU memory
 
 Device memory grows with the image area; the feature count adds little. Measured on an NVIDIA
