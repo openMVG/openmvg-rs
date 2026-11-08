@@ -16,6 +16,16 @@ break the API. [MIGRATION.md](MIGRATION.md) states the compatibility rules.
   `Dataset::from_dir_with` can declare the camera model of EXIF groups and give images without
   EXIF camera make and model one shared camera, as `openmvg-sfm --camera-model` and
   `--share-intrinsics` do.
+- `control_points`: `register_control_points` triangulates points of known geometry (printed
+  markers, scale bars, surveyed points) in a reconstruction and fits one scale to all their
+  groups, or a similarity into the frame of a reference group; `Reconstruction::transformed`
+  applies it to every pose and landmark.
+
+#### `openmvg-cli`
+
+- `openmvg-sfm --control-points FILE` scales the reconstruction to the control unit, or registers
+  it into the reference group's frame, before writing it, and writes
+  `control_points_report.json` with the residuals.
 
 #### Python bindings
 

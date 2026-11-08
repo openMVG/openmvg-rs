@@ -81,6 +81,40 @@ impl Reconstruction {
         self.calibrated_intrinsics
     }
 
+    /// The same reconstruction with every camera pose and landmark moved by `similarity`, such as
+    /// the one [`register_control_points`](crate::control_points::register_control_points) fits.
+    ///
+    /// Reprojections do not change; distances scale by the similarity's factor. The intermediate
+    /// rotation and camera-centre estimates of Global averaging are dropped, because they would
+    /// stay in the old frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SfmError::InvalidInput`] when a transformed pose is not a valid rotation and
+    /// centre, which only a non-finite similarity produces.
+    pub fn transformed(&self, similarity: &nalgebra::Similarity3<f64>) -> crate::Result<Self> {
+        let mut workspace = self.workspace.clone();
+        let records: Vec<PoseRecord> = workspace
+            .poses
+            .iter_populated()
+            .map(|(_, record)| record.clone())
+            .collect();
+        for record in records {
+            let pose = crate::control_points::transform_pose(&record.pose, similarity)?;
+            workspace.set_pose(PoseRecord::new(record.id, pose, record.component))?;
+        }
+        for landmark in workspace.landmarks.as_mut_slice() {
+            landmark.point = similarity.transform_point(&landmark.point);
+        }
+        workspace.rotation_estimates = None;
+        workspace.camera_centers = None;
+        Ok(Self::new(
+            workspace,
+            self.engine,
+            self.calibrated_intrinsics,
+        ))
+    }
+
     /// Root seed of the run that produced this reconstruction; persisted in its file.
     #[must_use]
     pub const fn root_seed(&self) -> openmvg_core::RunSeed {

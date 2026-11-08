@@ -203,6 +203,9 @@ pub mod checkpoint;
 /// The policies of the Incremental and Global engines: thresholds, iteration limits and stage
 /// switches. Each engine's `Default` is the recommended policy.
 pub mod config;
+/// Scale a reconstruction, or register it into a known frame, with control points: printed
+/// markers, scale bars or surveyed points observed in the images.
+pub mod control_points;
 mod determinism;
 mod error;
 #[cfg(feature = "unstable-internals")]
