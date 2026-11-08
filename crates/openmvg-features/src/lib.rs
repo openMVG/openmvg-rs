@@ -95,6 +95,7 @@
 //! | `std` | yes | Matching, tracking, the checked `model` values, and their standard-library dependencies |
 //! | `parallel` | yes | Rayon in the detectors, in `HnswMatcher::query_all_stored_with_ef`, and in the track scale check; results do not depend on the thread count |
 //! | `libm` | no | `no_std + alloc` math through `libm`, with `default-features = false`; extraction only |
+//! | `gpu` | no | Optional wgpu SIFT backend (`SiftGpuExtractor`); requires `std` and a compatible adapter at construction |
 //!
 //! For a `no_std + alloc` build:
 //!

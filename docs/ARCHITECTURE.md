@@ -159,6 +159,7 @@ The main capability flags:
 | `openmvg` | `io` | OMVG community format as `openmvg::io`; implies `sfm`, adds Arrow and Parquet |
 | `openmvg-features` | `std`, `parallel` | Default native profile |
 | `openmvg-features` | `libm` | Explicit alloc-only feature profile |
+| `openmvg-features` | `gpu` | Optional wgpu SIFT backend; needs `std` and a native GPU adapter |
 | `openmvg-sfm` | `parallel` | Native Rayon execution; default |
 | `openmvg-sfm` | `image-io` | Filesystem image discovery, decoding, and EXIF metadata |
 | `openmvg-sfm` | `observer` | Behavior-neutral reconstruction events |
