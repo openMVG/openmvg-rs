@@ -44,9 +44,41 @@ pub struct FrontendReport {
     /// features.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extraction_method: Option<crate::ExtractionMethod>,
+    /// Focal pre-calibration, when requested and some shared camera group has a guessed focal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focal_calibration: Option<FocalCalibrationReport>,
     /// Radial pre-calibration, when requested and some camera group has unknown distortion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radial_calibration: Option<RadialCalibrationReport>,
+}
+
+/// One camera group's focal-length estimate from the fundamental matrices of its pairs.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct FocalGroupEstimate {
+    /// Camera group (shared intrinsic) the estimate belongs to.
+    pub intrinsic_id: IntrinsicId,
+    /// Matched pairs inside the group whose fundamental matrix kept enough inliers to profile.
+    pub pair_count: usize,
+    /// Pairs whose cost is lower at the selected focal length than at the guess.
+    pub improved_pair_count: usize,
+    /// The guessed focal length the group started with, in pixels.
+    pub initial_focal: f64,
+    /// Selected focal length in pixels; the guess when the estimate is not accepted.
+    pub focal: f64,
+    /// Median cost at the selected focal length divided by the median cost at the guess.
+    pub cost_ratio: f64,
+    /// The selected focal is an interior grid minimum that passes the sign test; it replaced the
+    /// guess before verification.
+    pub accepted: bool,
+}
+
+/// Focal-length estimates of the camera groups whose focal was a guess.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct FocalCalibrationReport {
+    /// One estimate per profiled camera group.
+    pub groups: Vec<FocalGroupEstimate>,
 }
 
 /// One camera group's radial-distortion estimate in one calibration round.

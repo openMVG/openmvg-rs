@@ -140,7 +140,7 @@ The public workflow state is `Dataset`, `ViewGraph`, and `Reconstruction`, with 
 engines, Incremental and Global; this workflow is part of the stable v0.1 API.
 
 A dataset records whether its camera models are a known calibration or initial estimates; the
-`ViewGraph` and its checkpoint file carry that provenance, radial pre-calibration skips calibrated
+`ViewGraph` and its checkpoint file carry that provenance, focal and radial pre-calibration skip calibrated
 datasets, and both engines keep calibrated intrinsics
 fixed while refining estimates. The `ViewGraph` and its checkpoint file also record the
 `ExtractionMethod` (SIFT or ALP) the `Frontend` extracted with.

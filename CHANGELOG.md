@@ -16,11 +16,28 @@ break the API. [MIGRATION.md](MIGRATION.md) states the compatibility rules.
   `Dataset::from_dir_with` can declare the camera model of EXIF groups and give images without
   EXIF camera make and model one shared camera, as `openmvg-sfm --camera-model` and
   `--share-intrinsics` do.
+- Focal pre-calibration: `Frontend::with_focal_calibration` (on by default) estimates the focal
+  length of a camera group shared by two or more images whose focal is a guess, before
+  verification, from the fundamental matrices of the group's pairs (Mendonça and Cipolla, CVPR
+  1999). `FrontendReport::focal_calibration` and `SfmProgressStage::FocalCalibration` report it.
+
+#### `openmvg-cli`
+
+- `openmvg-sfm --no-focal-calibration` keeps the image-size focal guess.
 
 #### Python bindings
 
 - `reconstruct(camera_model=..., share_intrinsics=...)`, with the names of the
   `openmvg-sfm` options: frames extracted from one video can share one estimated camera.
+
+### Changed
+
+#### `openmvg-sfm`
+
+- A camera group whose focal length is a guess (no focal metadata that converts to pixels) and
+  that two or more images share, such as video frames with `--share-intrinsics`, is verified with
+  the estimated focal length instead of the guess (1.2 times the longest image edge without any
+  focal metadata). Front ends restored from JSON written before the option existed keep the guess.
 
 ## [0.1.0] - 2026-10-24
 

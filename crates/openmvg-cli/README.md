@@ -46,7 +46,7 @@ the stable API of `openmvg-sfm` and `openmvg-io`, so a library user can reproduc
 | `--project FILE` | The grouping a project file sets, written by `openmvg-sfm-configure`; it replaces the four options above |
 | `--self-calibrate true/false` | Refine or freeze the declared camera models in bundle adjustment; by default EXIF groups are refined and a project says which |
 | `--detector alp` (default), `sift`; `--matcher hnsw` (default), `brute-force` | Feature detector and descriptor matcher |
-| `--density` (both detectors; `ultra` is SIFT only), `--max-dimension`, `--max-pairs-per-view`, `--no-radial-calibration` | The front-end settings of `openmvg_sfm::Frontend` |
+| `--density` (both detectors; `ultra` is SIFT only), `--max-dimension`, `--max-pairs-per-view`, `--no-focal-calibration`, `--no-radial-calibration` | The front-end settings of `openmvg_sfm::Frontend` |
 | `--seed` | Deterministic seed; the same inputs and seed give the same reconstruction |
 | `--output DIR`, `--colmap`, `--no-progress` | Output directory (default `images/sfm_output`), COLMAP text model, progress bars |
 

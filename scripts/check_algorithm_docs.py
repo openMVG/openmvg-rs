@@ -85,6 +85,7 @@ INTERNAL = (
     "openmvg-ba/src/numerics/sparse.rs",
     "openmvg-geometry/src/robust/genransac/mod.rs",
     "openmvg-sfm/src/ops/averaging/rigid_core.rs",
+    "openmvg-sfm/src/ops/focal_calibration.rs",
     "openmvg-sfm/src/ops/radial_calibration.rs",
     "openmvg-sfm/src/ops/track_scale.rs",
     "openmvg-sfm/src/pipelines/global/mod.rs",

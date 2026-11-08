@@ -27,7 +27,7 @@ const PROGRESS_CHARS: &str = "█▓▒░ ";
 const STEADY_TICK: Duration = Duration::from_millis(250);
 
 /// Display name and item unit of each stage, in pipeline order.
-const STAGES: [(SfmProgressStage, &str, &str); 13] = [
+const STAGES: [(SfmProgressStage, &str, &str); 14] = [
     (
         SfmProgressStage::FeatureExtraction,
         "Extracting features",
@@ -39,6 +39,11 @@ const STAGES: [(SfmProgressStage, &str, &str); 13] = [
         "images",
     ),
     (SfmProgressStage::Matching, "Matching pairs", "pairs"),
+    (
+        SfmProgressStage::FocalCalibration,
+        "Estimating focals",
+        "groups",
+    ),
     (SfmProgressStage::Verification, "Verifying pairs", "pairs"),
     (
         SfmProgressStage::RadialCalibration,

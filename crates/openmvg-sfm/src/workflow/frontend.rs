@@ -27,8 +27,8 @@ fn is_unlimited_budget(budget: &FeatureBudgetPolicy) -> bool {
 /// [`DetectorDensity::High`](crate::DetectorDensity::High) on at most 1600 pixels per image edge,
 /// describes them with RootSIFT (SIFT descriptors with a square-root normalization, stored as
 /// bytes), matches them with [`MatchingMethod::Hnsw`], an approximate nearest-neighbor search,
-/// keeps the matches that pass Lowe's ratio test in both directions, and pre-calibrates radial
-/// distortion. The `with_*` knobs adjust it, and [`Frontend::with_extraction_method`] selects
+/// keeps the matches that pass Lowe's ratio test in both directions, pre-calibrates guessed focal
+/// lengths and radial distortion. The `with_*` knobs adjust it, and [`Frontend::with_extraction_method`] selects
 /// [`ExtractionMethod::Sift`] at the same density instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Frontend {
@@ -39,6 +39,8 @@ pub struct Frontend {
     pub(super) feature_budget: FeatureBudgetPolicy,
     #[serde(default)]
     pub(super) matching_method: MatchingMethod,
+    #[serde(default)]
+    pub(super) focal_calibration: bool,
     #[serde(default)]
     pub(super) radial_calibration: bool,
     #[serde(default)]
@@ -83,6 +85,7 @@ impl Frontend {
             extraction_method: ExtractionMethod::Alp,
             feature_budget: FeatureBudgetPolicy::Unlimited,
             matching_method: MatchingMethod::Hnsw,
+            focal_calibration: true,
             radial_calibration: true,
             max_pairs_per_view: None,
         }
@@ -164,6 +167,18 @@ impl Frontend {
         self.sift.density()
     }
 
+    /// Estimate the focal length before verification for camera groups shared by two or more
+    /// views whose focal is a guess ([`IntrinsicPrior::Guess`](crate::model::IntrinsicPrior::Guess),
+    /// such as images without focal metadata). Each pair's fundamental matrix needs no
+    /// intrinsics; the focal length that turns most of them into essential matrices replaces the
+    /// guess. Groups with a trusted focal, with known distortion, and datasets with
+    /// [calibrated intrinsics](Dataset::has_calibrated_intrinsics) are never changed.
+    #[must_use]
+    pub const fn with_focal_calibration(mut self, focal_calibration: bool) -> Self {
+        self.focal_calibration = focal_calibration;
+        self
+    }
+
     /// Estimate `k1` after verification for camera groups that declare a radial model with
     /// unknown (all-zero) distortion. Pinhole groups, groups with known distortion, and datasets
     /// with [calibrated intrinsics](Dataset::has_calibrated_intrinsics) are never changed.
@@ -225,9 +240,17 @@ impl Frontend {
         workspace.install_pair_graph_before_matching(
             crate::workspace::pair_graph::PairGraph::exhaustive(workspace.views().len())?,
         )?;
-        // A calibrated dataset keeps its distortion, even when it is zero.
+        // A calibrated dataset keeps its focal and its distortion, even when it is zero.
+        let focal_calibration = self.focal_calibration && !dataset.calibrated_intrinsics;
         let radial_calibration = self.radial_calibration && !dataset.calibrated_intrinsics;
-        let report = self.run_stages(&mut workspace, None, None, radial_calibration, progress)?;
+        let report = self.run_stages(
+            &mut workspace,
+            None,
+            None,
+            focal_calibration,
+            radial_calibration,
+            progress,
+        )?;
         // Descriptors serve matching only; the graph keeps the keypoints its matches index.
         workspace.release_descriptors()?;
         let graph = ViewGraph::try_from_workspace(workspace)?
@@ -255,6 +278,7 @@ impl Frontend {
             workspace,
             extractor,
             matcher,
+            self.focal_calibration,
             self.radial_calibration,
             progress,
         )
@@ -265,6 +289,7 @@ impl Frontend {
         workspace: &mut SfmWorkspace,
         extractor: Option<&dyn crate::backends::FeatureExtractor>,
         matcher: Option<&dyn crate::backends::PairMatcher>,
+        focal_calibration: bool,
         radial_calibration: bool,
         progress: &dyn crate::progress::SfmProgressSink,
     ) -> Result<crate::reports::FrontendReport> {
@@ -316,6 +341,7 @@ impl Frontend {
             extractor,
             matcher,
             &crate::adapters::verification::CalibratedVerifier::default(),
+            focal_calibration,
             radial_calibration,
             self.max_pairs_per_view,
             progress,
@@ -358,6 +384,7 @@ mod tests {
                 "sift": {"preset": "quality", "density": "high", "max_dimension": 1600},
                 "extraction_method": "alp",
                 "matching_method": "hnsw",
+                "focal_calibration": true,
                 "radial_calibration": true,
                 "max_pairs_per_view": null,
             })

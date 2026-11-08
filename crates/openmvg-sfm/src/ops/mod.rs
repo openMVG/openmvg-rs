@@ -28,6 +28,11 @@ pub(crate) mod features;
     not(any(feature = "image-io", feature = "unstable-internals")),
     allow(dead_code)
 )]
+pub(crate) mod focal_calibration;
+#[cfg_attr(
+    not(any(feature = "image-io", feature = "unstable-internals")),
+    allow(dead_code)
+)]
 pub mod frontend;
 #[cfg_attr(
     not(any(feature = "image-io", feature = "unstable-internals")),
